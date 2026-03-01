@@ -1,0 +1,9 @@
+{
+  "manifest_version": 1,
+  "name": "NewAPI 插件套件",
+  "version": "1.1.0",
+  "description": "集成了核心用户管理与娱乐功能的New API插件套件，移植自 AstrBot。",
+  "author": {
+    "name": "Future-404"
+  }
+}
