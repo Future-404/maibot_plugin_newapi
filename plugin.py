@@ -65,6 +65,14 @@ class NewApiBaseCommand(BaseCommand):
             
         return None
 
+    def is_admin(self) -> bool:
+        """权限校验：判断当前用户是否在管理员白名单中。"""
+        user_id = self.message.message_info.user_info.user_id
+        admin_list = self.get_config("permission_settings.admin_list", [])
+        
+        # 字符串化比较，确保兼容雪花 ID
+        return str(user_id) in [str(admin) for admin in admin_list]
+
 class PingApiCommand(NewApiBaseCommand):
     """响应ping命令，并报告数据库状态。"""
     command_name = "pingapi"
@@ -204,7 +212,7 @@ class HeistCommand(NewApiBaseCommand):
     """(娱乐) 对 @ 的目标发起打劫。"""
     command_name = "打劫"
     command_description = "(娱乐) 对 @ 的目标发起打劫。"
-    command_pattern = r"^/打劫(?:\s+|$)" # 匹配以 /打劫 开头，后面跟空格或结束的消息
+    command_pattern = r"^/打劫(?:\s+|$)"
 
     async def execute(self) -> Tuple[bool, Optional[str], bool]:
         robber_user_id = int(self.message.message_info.user_info.user_id)
@@ -249,7 +257,6 @@ class HeistCommand(NewApiBaseCommand):
                 reply = "❓ 发生未知错误。"
         
         await self.send_text(reply)
-        # 返回 True (第三个参数) 明确告知系统拦截此消息，不再交给 LLM 处理
         return True, reply, True
 
 class UnbindCommand(NewApiBaseCommand):
@@ -259,6 +266,10 @@ class UnbindCommand(NewApiBaseCommand):
     command_pattern = r"^/解绑(?:\s+(?P<identifier>\d+))?$"
 
     async def execute(self) -> Tuple[bool, Optional[str], bool]:
+        if not self.is_admin():
+            await self.send_text("⛔ 权限不足：只有管理员可以执行此操作。")
+            return True, "Permission denied", True
+
         identifier = self.get_target_id()
         if not identifier:
             await self.send_text("格式错误。请使用 `/解绑 [ID/雪花ID]` 或 `/解绑 @用户`")
@@ -295,6 +306,10 @@ class LookupCommand(NewApiBaseCommand):
     command_pattern = r"^/查询(?:\s+(?P<identifier>\d+))?$"
 
     async def execute(self) -> Tuple[bool, Optional[str], bool]:
+        if not self.is_admin():
+            await self.send_text("⛔ 权限不足：只有管理员可以执行此操作。")
+            return True, "Permission denied", True
+
         identifier = self.get_target_id()
         if not identifier:
             await self.send_text("格式错误。请使用 `/查询 [ID/雪花ID]` 或 `/查询 @用户`")
@@ -322,6 +337,10 @@ class AdjustBalanceCommand(NewApiBaseCommand):
     command_pattern = r"^/调整余额(?:\s+(?P<identifier>\d+))?\s+(?P<display_adjustment>[+-]?\d+(\.\d+)?)$"
 
     async def execute(self) -> Tuple[bool, Optional[str], bool]:
+        if not self.is_admin():
+            await self.send_text("⛔ 权限不足：只有管理员可以执行此操作。")
+            return True, "Permission denied", True
+
         identifier = self.get_target_id()
         display_adjustment_str = self.matched_groups.get("display_adjustment", "0")
         display_adjustment = float(display_adjustment_str)
@@ -363,57 +382,66 @@ class NewApiSuitePlugin(BasePlugin):
     config_file_name = "config.toml"
 
     config_section_descriptions = {
-        "plugin": "插件基本设置",
-        "binding_settings": "核心绑定功能",
-        "check_in_settings": "签到功能设置",
-        "heist_settings": "打劫功能设置",
-        "optional_pm_settings": "可选私信设置"
+        "plugin": "🔌 插件基本设置",
+        "permission_settings": "🛡️ 权限控制设置",
+        "binding_settings": "🔗 核心绑定设置",
+        "check_in_settings": "📅 签到功能设置",
+        "heist_settings": "⚔️ 打劫互动设置",
+        "optional_pm_settings": "📩 可选通知设置"
     }
 
     config_schema = {
         "plugin": {
-            "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
-            "config_version": ConfigField(type=str, default="1.1.0", description="配置文件版本"),
+            "enabled": ConfigField(label="启用插件", type=bool, default=True, description="是否开启本插件的所有功能"),
+            "config_version": ConfigField(label="配置版本", type=str, default="1.1.0", description="配置文件版本，请勿手动修改"),
+        },
+        "permission_settings": {
+            "admin_list": ConfigField(
+                label="管理员 ID 列表", 
+                type=list, 
+                default=[], 
+                description="拥有管理权限的 Discord 用户 ID (雪花 ID) 列表"
+            ),
         },
         "binding_settings": {
-            "binding_group": ConfigField(type=str, default="default", description="绑定后自动设置的用户组"),
-            "quota_display_ratio": ConfigField(type=int, default=500000, description="额度显示比例"),
+            "binding_group": ConfigField(label="默认用户组", type=str, default="default", description="绑定成功后，自动将网站用户设置到此分组"),
+            "quota_display_ratio": ConfigField(label="额度转换比例", type=int, default=500000, description="API 原始额度与显示额度的比例 (默认 500000:1)"),
         },
         "check_in_settings": {
-            "enabled": ConfigField(type=bool, default=True, description="是否启用签到"),
-            "timezone_offset_hours": ConfigField(type=int, default=8, description="时区偏移"),
-            "min_display_quota": ConfigField(type=float, default=1500.0, description="最小签到奖励"),
-            "max_display_quota": ConfigField(type=float, default=1500.0, description="最大签到奖励"),
-            "double_chance": ConfigField(type=float, default=0.1, description="双倍奖励概率"),
-            "first_check_in_bonus_enabled": ConfigField(type=bool, default=True, description="首次签到奖励"),
-            "first_check_in_bonus_display_quota": ConfigField(type=float, default=2.0, description="首次奖励额度"),
-            "check_in_success_template": ConfigField(type=str, default="签到成功！您获得了 {display_added} 额度，当前剩余总额度为 {display_total}。", description="成功模板"),
-            "check_in_doubled_template": ConfigField(type=str, default="🎉 好运连连！签到成功并触发了双倍奖励！🎉\n\n您获得了 {display_added} 额度，当前剩余总额度为 {display_total}。", description="双倍模板"),
-            "first_check_in_success_template": ConfigField(type=str, default="✨ 欢迎您的第一次签到！✨\n\n您获得了 {display_added} 额度 (内含一份额外新人礼包哦！)\n当前剩余总额度为 {display_total}。", description="首次模板"),
+            "enabled": ConfigField(label="启用签到", type=bool, default=True, description="是否允许用户使用 /签到 命令"),
+            "timezone_offset_hours": ConfigField(label="时区偏移", type=int, default=8, description="相对于 UTC 的时区偏移 (北京时间为 8)"),
+            "min_display_quota": ConfigField(label="最小奖励", type=float, default=1500.0, description="签到获得的最小显示额度"),
+            "max_display_quota": ConfigField(label="最大奖励", type=float, default=1500.0, description="签到获得的最大显示额度"),
+            "double_chance": ConfigField(label="双倍概率", type=float, default=0.1, description="触发双倍奖励的概率 (0.0 到 1.0)"),
+            "first_check_in_bonus_enabled": ConfigField(label="新人礼包", type=bool, default=True, description="是否在首次签到时赠送额外额度"),
+            "first_check_in_bonus_display_quota": ConfigField(label="新人奖励额度", type=float, default=2.0, description="新人首次签到额外获得的显示额度"),
+            "check_in_success_template": ConfigField(label="成功模板", type=str, default="签到成功！您获得了 {display_added} 额度，当前剩余总额度为 {display_total}。", description="普通签到成功的回复文案"),
+            "check_in_doubled_template": ConfigField(label="双倍模板", type=str, default="🎉 好运连连！签到成功并触发了双倍奖励！🎉\n\n您获得了 {display_added} 额度，当前剩余总额度为 {display_total}。", description="双倍签到成功的回复文案"),
+            "first_check_in_success_template": ConfigField(label="新人模板", type=str, default="✨ 欢迎您的第一次签到！✨\n\n您获得了 {display_added} 额度 (内含一份额外新人礼包哦！)\n当前剩余总额度为 {display_total}。", description="新人首次签到的回复文案"),
         },
         "heist_settings": {
-            "enabled": ConfigField(type=bool, default=True, description="是否启用打劫"),
-            "max_attempts_per_day": ConfigField(type=int, default=1, description="每日打劫限制"),
-            "max_defenses_per_day": ConfigField(type=int, default=3, description="每日被劫限制"),
-            "min_amount": ConfigField(type=float, default=5.0, description="最小劫掠额度"),
-            "max_amount": ConfigField(type=float, default=40.0, description="最大劫掠额度"),
-            "critical_chance": ConfigField(type=float, default=0.1, description="暴击概率"),
-            "failure_chance": ConfigField(type=float, default=0.5, description="失败概率"),
-            "failure_penalty": ConfigField(type=float, default=100.0, description="失败罚金"),
-            "cooldown_seconds": ConfigField(type=int, default=3600, description="冷却秒数"),
-            "success_template": ConfigField(type=str, default="✅ 打劫成功！你悄悄地从对方口袋里摸走了 {gain:.2f} 额度。", description="成功模板"),
-            "critical_template": ConfigField(type=str, default="🎉 暴击！你的手法如此娴熟，居然摸走了双倍的 {gain:.2f} 额度！", description="暴击模板"),
-            "failure_template": ConfigField(type=str, default="💥 失手了！你在打劫时笨手笨脚，反被对方揍了一顿，赔偿了 {penalty:.2f} 额度。", description="失败模板"),
-            "attempts_exceeded_template": ConfigField(type=str, default="🥵 你今天已经打劫累了，先去歇会儿吧，明天再来。", description="次数超限模板"),
-            "defenses_exceeded_template": ConfigField(type=str, default="🛡️ 对方(ID:{victim_id})今天已经被打劫太多次了，看起来已经有了防备，换个目标吧。", description="防御超限模板"),
-            "victim_not_found_template": ConfigField(type=str, default="💨 你朝着空气挥舞拳头，但并没有找到ID为 {victim_identifier} 的目标。", description="目标未找到模板"),
-            "cannot_rob_self_template": ConfigField(type=str, default="🤦‍♂️ 你不能打劫你自己，这毫无意义！", description="不能自劫模板"),
-            "robber_not_bound_template": ConfigField(type=str, default="🤔 你自己都还没绑定账号，抢来的钱往哪儿放呢？快去 /绑定 吧！", description="未绑定模板"),
-            "cooldown_template": ConfigField(type=str, default="⏳ 你刚刚打劫完，正在被官府通缉呢！先躲一会儿吧，还剩 {remaining_time} 秒才能再次行动。", description="冷却模板"),
+            "enabled": ConfigField(label="启用打劫", type=bool, default=True, description="是否开启趣味打劫功能"),
+            "max_attempts_per_day": ConfigField(label="每日发起上限", type=int, default=1, description="每个用户每天最多发起的打劫次数"),
+            "max_defenses_per_day": ConfigField(label="每日被劫上限", type=int, default=3, description="每个用户每天最多被成功打劫的次数"),
+            "min_amount": ConfigField(label="最小劫掠额度", type=float, default=5.0, description="成功打劫时的最小随机数额"),
+            "max_amount": ConfigField(label="最大劫掠额度", type=float, default=40.0, description="成功打劫时的随机最大数额"),
+            "critical_chance": ConfigField(label="暴击概率", type=float, default=0.1, description="触发双倍金额的概率"),
+            "failure_chance": ConfigField(label="失败概率", type=float, default=0.5, description="打劫失败并反赔对方额度的概率"),
+            "failure_penalty": ConfigField(label="失败赔偿额度", type=float, default=100.0, description="打劫失败时固定赔付给对方的数额"),
+            "cooldown_seconds": ConfigField(label="冷却时间(秒)", type=int, default=3600, description="两次打劫之间的最小间隔时间"),
+            "success_template": ConfigField(label="成功模板", type=str, default="✅ 打劫成功！你悄悄地从对方口袋里摸走了 {gain:.2f} 额度。", description="打劫成功文案"),
+            "critical_template": ConfigField(label="暴击模板", type=str, default="🎉 暴击！你的手法如此娴熟，居然摸走了双倍的 {gain:.2f} 额度！", description="打劫暴击文案"),
+            "failure_template": ConfigField(label="失败模板", type=str, default="💥 失手了！你在打劫时笨手笨脚，反被对方揍了一顿，赔偿了 {penalty:.2f} 额度。", description="打劫失败文案"),
+            "attempts_exceeded_template": ConfigField(label="次数超限模板", type=str, default="🥵 你今天已经打劫累了，先去歇会儿吧，明天再来。", description="超过发起次数上限时的提示"),
+            "defenses_exceeded_template": ConfigField(label="防御超限模板", type=str, default="🛡️ 对方(ID:{victim_id})今天已经被打劫太多次了，看起来已经有了防备，换个目标吧。", description="目标被劫次数过多时的提示"),
+            "victim_not_found_template": ConfigField(label="目标未找到模板", type=str, default="💨 你朝着空气挥舞拳头，但并没有找到ID为 {victim_identifier} 的目标。", description="找不到目标用户时的提示"),
+            "cannot_rob_self_template": ConfigField(label="不能自劫模板", type=str, default="🤦‍♂️ 你不能打劫你自己，这毫无意义！", description="尝试打劫自己时的提示"),
+            "robber_not_bound_template": ConfigField(label="未绑定模板", type=str, default="🤔 你自己都还没绑定账号，抢来的钱往哪儿放呢？快去 /绑定 吧！", description="发起者未绑定时的提示"),
+            "cooldown_template": ConfigField(label="冷却提示模板", type=str, default="⏳ 你刚刚打劫完，正在被官府通缉呢！先躲一会儿吧，还剩 {remaining_time} 秒才能再次行动。", description="冷却时间未到时的提示"),
         },
         "optional_pm_settings": {
-            "enable_bind_success_pm": ConfigField(type=bool, default=True, description="成功后发私信"),
-            "bind_success_pm_template": ConfigField(type=str, default="绑定成功！", description="私信模板"),
+            "enable_bind_success_pm": ConfigField(label="绑定成功私信", type=bool, default=True, description="绑定成功后是否尝试向用户发送私信确认"),
+            "bind_success_pm_template": ConfigField(label="私信模板", type=str, default="绑定成功！", description="私信通知的内容"),
         }
     }
 
@@ -489,5 +517,5 @@ class NewApiSuitePlugin(BasePlugin):
         
         except Exception as e:
             logger.error(f"绑定仪式中发生错误: {e}", exc_info=True)
-            await self.core.delete_binding(qq_id=user_id)
+            if self.core: await self.core.delete_binding(qq_id=user_id)
             return False, "绑定过程中发生未知错误，操作已自动撤销，请联系管理员。"

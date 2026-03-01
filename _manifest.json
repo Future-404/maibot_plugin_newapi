@@ -5,5 +5,6 @@
   "description": "集成了核心用户管理与娱乐功能的New API插件套件，移植自 AstrBot。",
   "author": {
     "name": "Future-404"
-  }
+  },
+  "id": "Future-404.maibot_plugin_newapi"
 }
