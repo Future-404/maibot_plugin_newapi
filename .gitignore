@@ -37,3 +37,4 @@ config.toml
 .idea/
 *.swp
 *.swo
+config.toml.backup.*
