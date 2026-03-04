@@ -6,7 +6,7 @@ from typing import List, Tuple, Type, Optional, Any, Dict, TYPE_CHECKING
 from src.plugin_system import (
     BasePlugin, register_plugin, BaseCommand, ComponentInfo,
     BaseAction, ActionActivationType, BaseEventHandler, EventType,
-    ConfigField
+    ConfigField, MaiMessages
 )
 from src.common.logger import get_logger
 
@@ -19,7 +19,7 @@ logger = get_logger("newapi_suite")
 _plugin_instance: Optional["NewApiSuitePlugin"] = None
 
 class NewApiBaseCommand(BaseCommand):
-    """NewAPI 插件命令基类（仅作为逻辑封装，不直接注册给系统）"""
+    """NewAPI 插件命令基类"""
     
     async def get_core(self) -> 'NewApiCore':
         from .newapi_utils import NewApiCore
@@ -40,22 +40,21 @@ class NewApiBaseCommand(BaseCommand):
         raise Exception("Plugin instance not initialized")
 
     def get_user_id(self) -> int:
-        """兼容获取用户ID"""
-        if hasattr(self.message, "message_info") and self.message.message_info:
+        """兼容性获取用户ID"""
+        try:
+            # 优先从隐身模式传入的 dict 中读取
+            if hasattr(self.message, "message_base_info"):
+                return int(self.message.message_base_info.get("user_id", 0))
+            # 否则从标准对象读取
             return int(self.message.message_info.user_info.user_id)
-        elif hasattr(self.message, "message_base_info"):
-            return int(self.message.message_base_info.get("user_id", 0))
-        return 0
+        except: return 0
 
     def get_target_id(self, param_name: str = "identifier") -> Optional[int]:
-        """兼容获取目标ID (被@的用户)"""
+        """兼容性获取目标ID (被@的用户)"""
         segs = []
-        if hasattr(self.message, "message_segment") and self.message.message_segment:
-            if self.message.message_segment.type == "seglist":
-                segs = self.message.message_segment.data
-            else:
-                segs = [self.message.message_segment]
-        elif hasattr(self.message, "message_segments") and self.message.message_segments:
+        if hasattr(self.message, "message_segment"):
+            segs = self.message.message_segment.data if self.message.message_segment.type == "seglist" else [self.message.message_segment]
+        elif hasattr(self.message, "message_segments"):
             segs = self.message.message_segments
             
         def find_mentions(s_list):
@@ -76,32 +75,28 @@ class NewApiBaseCommand(BaseCommand):
 
     def is_admin(self) -> bool:
         user_id = self.get_user_id()
-        admin_list = _plugin_instance.config.get("permission_settings", {}).get("admin_list", [])
+        admin_list = self.get_config("permission_settings.admin_list", [])
         return str(user_id) in [str(admin) for admin in admin_list]
 
     async def send_text(self, content: str, set_reply: bool = False, reply_message: Any = None, storage_message: bool = False) -> bool:
-        """计算 stream_id 并使用 text_to_stream 发送，彻底切断数据库留痕"""
+        """隐身发送：直接投递到流，不在数据库留痕"""
         try:
             from src.plugin_system.apis import send_api
             from src.chat.message_receive.chat_stream import get_chat_manager
             
+            # 获取环境信息
             base_info = getattr(self.message, 'message_base_info', {})
             platform = base_info.get("platform") or "discord_bot_instance_1"
             
             is_group = getattr(self.message, 'is_group_message', False)
-            if not is_group and "group_id" in base_info:
-                is_group = True
+            if not is_group and "group_id" in base_info: is_group = True
                 
-            if is_group:
-                target_id = str(base_info.get("group_id", ""))
-            else:
-                target_id = str(base_info.get("user_id", self.get_user_id()))
-                
+            target_id = str(base_info.get("group_id", "")) if is_group else str(base_info.get("user_id", self.get_user_id()))
+            
             if not target_id or target_id == "0":
-                logger.error("[Stealth Error] 无法确定目标 ID，发送失败。")
-                return False
+                # 退而求其次，尝试标准方法发送
+                return await super().send_text(content)
                 
-            # 使用 MaiBot 核心方法计算 stream_id
             stream_id = get_chat_manager().get_stream_id(platform, target_id, is_group)
             
             return await send_api.text_to_stream(
@@ -109,25 +104,24 @@ class NewApiBaseCommand(BaseCommand):
                 stream_id=stream_id,
                 set_reply=set_reply,
                 reply_message=reply_message,
-                storage_message=False  # 隐身模式，禁止留痕
+                storage_message=False  # 彻底隐身
             )
-            
         except Exception as e:
-            logger.error(f"[Stealth Error] 调用发送 API 失败: {e}")
-            return False
+            logger.error(f"[Stealth Send Error] {e}")
+            return await super().send_text(content)
 
 class PingApiCommand(NewApiBaseCommand):
     command_name = "pingapi"
-    command_pattern = r"^/pingapi"
+    command_pattern = r"^/pingapi$"
     async def execute(self) -> Tuple[bool, Optional[str], bool]:
         core = await self.get_core()
         db_status = "✅ 已连接" if os.path.exists(core.db_path) else "❓ 数据库文件未就绪"
-        await self.send_text(f"🎉 Pong! NewAPI 插件套件 V1.1.0 (Power Interceptor) 正在运行！\n--------------------\n数据库状态: {db_status}")
+        await self.send_text(f"🎉 Pong! NewAPI 插件套件 V1.1.0 (Stealth Mode) 正在运行！\n--------------------\n数据库状态: {db_status}")
         return True, None, True
 
 class QueryBalanceCommand(NewApiBaseCommand):
     command_name = "查询余额"
-    command_pattern = r"^/查询余额"
+    command_pattern = r"^/查询余额$"
     async def execute(self) -> Tuple[bool, Optional[str], bool]:
         user_id = self.get_user_id()
         core = await self.get_core()
@@ -147,7 +141,7 @@ class QueryBalanceCommand(NewApiBaseCommand):
 
 class BindCommand(NewApiBaseCommand):
     command_name = "绑定"
-    command_pattern = r"^/绑定\s+(?P<website_user_id>\d+)"
+    command_pattern = r"^/绑定\s+(?P<website_user_id>\d+)$"
     async def execute(self) -> Tuple[bool, Optional[str], bool]:
         website_user_id = int(self.matched_groups.get("website_user_id"))
         user_id = self.get_user_id()
@@ -165,7 +159,7 @@ class BindCommand(NewApiBaseCommand):
 
 class CheckInCommand(NewApiBaseCommand):
     command_name = "签到"
-    command_pattern = r"^/签到"
+    command_pattern = r"^/签到$"
     async def execute(self) -> Tuple[bool, Optional[str], bool]:
         user_id = self.get_user_id()
         core = await self.get_core()
@@ -189,7 +183,7 @@ class CheckInCommand(NewApiBaseCommand):
 
 class HeistCommand(NewApiBaseCommand):
     command_name = "打劫"
-    command_pattern = r"^/打劫"
+    command_pattern = r"^/打劫(?:\s+|$)"
     async def execute(self) -> Tuple[bool, Optional[str], bool]:
         robber_user_id = self.get_user_id()
         victim_user_id = self.get_target_id()
@@ -217,7 +211,7 @@ class HeistCommand(NewApiBaseCommand):
 
 class UnbindCommand(NewApiBaseCommand):
     command_name = "解绑"
-    command_pattern = r"^/解绑(?:\s+(?P<identifier>\d+))?"
+    command_pattern = r"^/解绑(?:\s+(?P<identifier>\d+))?$"
     async def execute(self) -> Tuple[bool, Optional[str], bool]:
         if not self.is_admin():
             await self.send_text("⛔ 权限不足。")
@@ -237,7 +231,7 @@ class UnbindCommand(NewApiBaseCommand):
 
 class LookupCommand(NewApiBaseCommand):
     command_name = "查询"
-    command_pattern = r"^/查询(?:\s+(?P<identifier>\d+))?"
+    command_pattern = r"^/查询(?:\s+(?P<identifier>\d+))?$"
     async def execute(self) -> Tuple[bool, Optional[str], bool]:
         if not self.is_admin():
             await self.send_text("⛔ 权限不足。")
@@ -256,7 +250,7 @@ class LookupCommand(NewApiBaseCommand):
 
 class AdjustBalanceCommand(NewApiBaseCommand):
     command_name = "调整余额"
-    command_pattern = r"^/调整余额(?:\s+(?P<identifier>\d+))?\s+(?P<display_adjustment>[+-]?\d+(\.\d+)?)"
+    command_pattern = r"^/调整余额(?:\s+(?P<identifier>\d+))?\s+(?P<display_adjustment>[+-]?\d+(\.\d+)?)$"
     async def execute(self) -> Tuple[bool, Optional[str], bool]:
         if not self.is_admin():
             await self.send_text("⛔ 权限不足。")
@@ -272,10 +266,10 @@ class AdjustBalanceCommand(NewApiBaseCommand):
         return True, None, True
 
 class NewApiStealthDispatcher(BaseEventHandler):
-    """(权力收拢) 统一分发器：拦截所有指令并执行权限校验。"""
+    """(权力巅峰) 统一拦截分发器：物理级屏蔽指令存储与 AI 反应。"""
     event_type = EventType.ON_MESSAGE_PRE_PROCESS
     handler_name = "newapi_stealth_dispatcher"
-    handler_description = "唯一指令入口：执行权限校验、指令分发与 AI 回复屏蔽。"
+    handler_description = "前置分发并熔断指令流，确保数据库零噪音、AI 零感应。"
     weight = 10000 
 
     async def execute(self, message: Any) -> Tuple[bool, bool, Optional[str], Optional[Any], Optional[Any]]:
@@ -283,37 +277,27 @@ class NewApiStealthDispatcher(BaseEventHandler):
         if not _plugin_instance: return True, True, None, None, None
         
         try:
-            # 兼容性获取原始消息
             raw = getattr(message, 'raw_message', "") or ""
             text = raw.strip()
             if not text.startswith("/"): return True, True, None, None, None
 
-            # 获取 MaiMessages 中的基础信息字典
+            # 环境预检
             base_info = getattr(message, 'message_base_info', {})
-            
-            # 频道ID判定
             is_group = getattr(message, 'is_group_message', False)
-            if not is_group and "group_id" in base_info:
-                is_group = True
-                
-            curr_id = base_info.get("group_id") if is_group else None
+            if not is_group and "group_id" in base_info: is_group = True
+            curr_id = str(base_info.get("group_id")) if is_group else None
             
-            # 1. 场景权限校验
+            # 1. 权限校验逻辑复用
             perm_conf = _plugin_instance.config.get("permission_settings", {})
-            if is_group and curr_id:
-                curr_id_str = str(curr_id)
-                allowed_groups = perm_conf.get("allowed_groups", [])
-                if allowed_groups:
-                    allowed_str_list = [str(gid) for gid in allowed_groups]
-                    if curr_id_str not in allowed_str_list:
-                        logger.info(f"[Power Dispatch] 拒绝执行: 频道 {curr_id_str} 不在白名单内。")
-                        return True, True, None, None, None
+            if is_group:
+                allowed_groups = [str(g) for g in perm_conf.get("allowed_groups", [])]
+                if allowed_groups and curr_id not in allowed_groups:
+                    return True, True, None, None, None # 不属于白名单频道，不予拦截，交给其他插件或AI处理
             else:
                 if not perm_conf.get("enable_private_chat", True):
-                    logger.info("[Power Dispatch] 拒绝执行: 私聊开关已关闭。")
                     return True, True, None, None, None
 
-            # 2. 指令解析 (改为 search 模式以应对空格和转义符)
+            # 2. 指令解析与分发
             commands_mapping = [
                 (PingApiCommand, PingApiCommand.command_pattern),
                 (QueryBalanceCommand, QueryBalanceCommand.command_pattern),
@@ -327,17 +311,16 @@ class NewApiStealthDispatcher(BaseEventHandler):
             
             for cmd_class, pattern in commands_mapping:
                 if m := re.search(pattern, text):
-                    logger.info(f"[Power Dispatch] 匹配成功: {cmd_class.command_name} (频道: {curr_id if curr_id else '私聊'})")
-                    # 手动分发
+                    logger.info(f"[Power Stealth] 拦截成功: {cmd_class.command_name}")
+                    # 手动注入逻辑
                     cmd_instance = cmd_class(message, _plugin_instance.config)
                     cmd_instance.set_matched_groups(m.groupdict())
                     await cmd_instance.execute()
-                    # 彻底熔断，AI 失明
+                    # 关键：彻底熔断消息流，禁止核心将其存入数据库
                     return True, False, None, None, None
                     
         except Exception as e:
-            logger.error(f"[Dispatcher Error] 拦截器异常: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"[Power Dispatcher Error] {e}")
             
         return True, True, None, None, None
 
