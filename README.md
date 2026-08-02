@@ -43,6 +43,8 @@
 - **签到功能**：奖励范围、双倍概率、新人礼包、提示词模板
 - **打劫互动**：成功率、冷却时间、每日次数上限、提示词模板
 - **可选通知**：绑定成功私信开关与模板
+- <img width="1381" height="643" alt="image" src="https://github.com/user-attachments/assets/0cf00dfb-01a3-46aa-8871-043b3a8803bf" />
+
 
 ## 目录结构
 
