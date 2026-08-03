@@ -34,7 +34,7 @@
       "value": "wallet"
     }
   },
-  "capabilities": ["send_message"],
+  "capabilities": ["send.text"],
   "i18n": {
     "default_locale": "zh-CN"
   }
