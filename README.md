@@ -44,6 +44,8 @@
 - **打劫互动**：成功率、冷却时间、每日次数上限、提示词模板
 - **可选通知**：绑定成功私信开关与模板
 - <img width="1381" height="643" alt="image" src="https://github.com/user-attachments/assets/0cf00dfb-01a3-46aa-8871-043b3a8803bf" />
+<img width="1616" height="690" alt="image" src="https://github.com/user-attachments/assets/17494cb3-ae6f-40c2-84f3-405877148ac4" />
+
 
 
 ## 目录结构
