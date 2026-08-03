@@ -10,6 +10,15 @@ logger = logging.getLogger("newapi_suite")
 
 # ============================== 配置模型 ==============================
 
+class PluginSection(PluginConfigBase):
+    __ui_label__ = "插件基本设置"
+    __ui_icon__ = "settings"
+    __ui_order__ = -1
+
+    enabled: bool = Field(default=True, description="是否启用插件")
+    config_version: str = Field(default="2.0.0", description="配置版本")
+
+
 class ApiSettings(PluginConfigBase):
     __ui_label__ = "NewAPI 连接设置"
     __ui_icon__ = "link"
@@ -103,8 +112,7 @@ class NewApiSuiteConfig(PluginConfigBase):
     __ui_label__ = "NewAPI 插件套件"
     __ui_icon__ = "wallet"
 
-    config_version: str = Field(default="2.0.0", description="配置版本")
-
+    plugin: PluginSection = Field(default_factory=PluginSection)
     api: ApiSettings = Field(default_factory=ApiSettings)
     permission: PermissionSettings = Field(default_factory=PermissionSettings)
     binding: BindingSettings = Field(default_factory=BindingSettings)
