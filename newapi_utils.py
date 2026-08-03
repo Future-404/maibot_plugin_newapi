@@ -40,21 +40,20 @@ class NewApiCore:
         return env
 
     async def initialize(self) -> bool:
-        """异步初始化：从插件配置读取 API 信息并建表。"""
+        """异步初始化：先建表，再检查 API 配置。"""
         self.refresh_config()
-        if not self.api_base_url or not self.api_access_token:
-            logger.error("[NewAPI Utils] API 配置不完整！初始化失败。请在 WebUI 或 config.toml 中配置。")
-            return False
-
-        # 初始化数据库表并开启高性能模式
+        # 数据库表始终初始化，不依赖 API 配置是否完整
         try:
             os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
             await asyncio.to_thread(self._ensure_tables_exist_sync)
             logger.info("✅ [NewAPI Utils] SQLite 数据库原子化配置已就绪 (WAL Mode Enabled)。")
-            return True
         except Exception as e:
             logger.error("❌ [NewAPI Utils] 数据库初始化失败: %s", e, exc_info=True)
             return False
+        if not self.api_base_url or not self.api_access_token:
+            logger.warning("[NewAPI Utils] API 配置不完整，功能暂不可用。请在 WebUI 或 config.toml 中配置 api_base_url / api_access_token。")
+            return False
+        return True
 
     def refresh_config(self) -> None:
         """重新读取 API 连接配置（配置热重载时调用）。"""

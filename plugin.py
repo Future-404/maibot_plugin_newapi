@@ -139,8 +139,10 @@ class NewApiSuitePlugin(MaiBotPlugin):
         from .heist_logic import HeistLogic
 
         self.core = NewApiCore(self, data_dir=str(self.ctx.paths.data_dir))
-        await self.core.initialize()
+        init_ok = await self.core.initialize()
         self.heist_handler = HeistLogic(self, self.core)
+        if not init_ok:
+            self.ctx.logger.warning("插件已加载，但 API 连接配置不完整，请在 WebUI 配置后使用")
         self.ctx.logger.info("NewAPI 插件套件初始化完成")
 
     async def on_unload(self) -> None:
