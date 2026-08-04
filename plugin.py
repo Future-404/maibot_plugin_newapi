@@ -10,17 +10,29 @@ logger = logging.getLogger("newapi_suite")
 
 
 class PluginSection(PluginConfigBase):
+    __ui_label__ = "插件基础设施"
+    __ui_icon__ = "settings"
+    __ui_order__ = 1
+
     enabled: bool = Field(default=True, description="是否启用插件")
     config_version: str = Field(default="2.0.0", description="配置规范版本")
 
 
 class ApiSettings(PluginConfigBase):
+    __ui_label__ = "NewAPI 连接设置"
+    __ui_icon__ = "link"
+    __ui_order__ = 2
+
     api_base_url: str = Field(default="http://172.17.0.1:3000", description="NewAPI 系统的基础 URL")
     api_access_token: str = Field(default="9PpvvEWCqdhIvZJglUi38qVcBB0BWknR", description="全限 API Token (用于管理员操作)")
     api_admin_user_id: str = Field(default="1", description="拥有管理员权限的 User-ID Header")
 
 
 class PermissionSettings(PluginConfigBase):
+    __ui_label__ = "权限控制"
+    __ui_icon__ = "shield"
+    __ui_order__ = 3
+
     mode: str = Field(default="all", description="运行模式: all / whitelist / blacklist")
     whitelist: List[str] = Field(default_factory=list, description="白名单列表")
     blacklist: List[str] = Field(default_factory=list, description="黑名单列表")
@@ -28,12 +40,20 @@ class PermissionSettings(PluginConfigBase):
 
 
 class BindingSettings(PluginConfigBase):
+    __ui_label__ = "账号绑定规则"
+    __ui_icon__ = "user-check"
+    __ui_order__ = 4
+
     binding_group: str = Field(default="vip", description="绑定成功后赋予的组别")
     unbind_group: str = Field(default="default", description="解绑后复原的组别")
     quota_display_ratio: float = Field(default=500000.0, description="额度展示比例")
 
 
 class CheckInSettings(PluginConfigBase):
+    __ui_label__ = "每日签到规则与模版"
+    __ui_icon__ = "calendar"
+    __ui_order__ = 5
+
     enabled: bool = Field(default=True, description="是否启用签到功能")
     timezone_offset_hours: int = Field(default=8, description="时区偏移")
     min_display_quota: float = Field(default=0.1, description="签到最小额度")
@@ -41,10 +61,26 @@ class CheckInSettings(PluginConfigBase):
     double_chance: float = Field(default=0.1, description="翻倍概率")
     first_check_in_bonus_enabled: bool = Field(default=True, description="首次签到奖励")
     first_check_in_bonus_display_quota: float = Field(default=100.0, description="首次签到额外额度")
+    check_in_success_template: str = Field(
+        default="✨ 签到成功！✨\n您获得了 {display_added:.2f} 额度！\n当前剩余总额度为 {display_total:.2f}。",
+        description="常规签到成功模板"
+    )
+    check_in_doubled_template: str = Field(
+        default="🎉 欧皇降临！奖励翻倍！获得了 {display_added:.2f} 额度！\n当前剩余总额度为 {display_total:.2f}。",
+        description="翻倍签到成功模板"
+    )
+    first_check_in_success_template: str = Field(
+        default="✨ 欢迎新人！✨您获得了 {display_added:.2f} 额度 (已加入100额度新人礼包了哦！)\n当前剩余总额度为 {display_total:.2f}。",
+        description="首次签到成功模板"
+    )
 
 
 class OptionalPmSettings(PluginConfigBase):
-    enable_all_pm: bool = Field(default=False, description="是否允许所有私聊指令")
+    __ui_label__ = "私聊高级开关"
+    __ui_icon__ = "message-square"
+    __ui_order__ = 6
+
+    enable_all_pm: bool = Field(default=True, description="是否允许所有私聊指令 (默认允许私聊绑定/查询/签到)")
 
 
 class NewApiSuiteConfig(PluginConfigBase):
@@ -167,6 +203,42 @@ class NewApiSuitePlugin(MaiBotPlugin):
         return ""
 
     def _extract_mention(self, message: Dict[str, Any]) -> Optional[int]:
+        if not isinstance(message, dict):
+            return None
+
+        # 1. 递归深度解析 message_segments 消息段节点 (旧版核心能力)
+        segments = message.get("message_segments", [])
+        if isinstance(segments, list) and segments:
+            def walk(items):
+                for segment in items:
+                    if not isinstance(segment, dict):
+                        continue
+                    seg_type = segment.get("type", "")
+                    data = segment.get("data") or {}
+                    if seg_type in ("at", "mention", "seg"):
+                        for key in ("user_id", "target_user_id"):
+                            value = data.get(key)
+                            if value is not None:
+                                try:
+                                    return int(value)
+                                except (TypeError, ValueError):
+                                    pass
+                        users = data.get("users") or []
+                        if users and users[0].get("user_id") is not None:
+                            try:
+                                return int(users[0]["user_id"])
+                            except (TypeError, ValueError):
+                                pass
+                    if seg_type == "seglist" and isinstance(data, list):
+                        res = walk(data)
+                        if res:
+                            return res
+                return None
+            res = walk(segments)
+            if res is not None:
+                return res
+
+        # 2. 回退使用正则抽取纯文本 content / raw_message 中的 CQ / Discord 格式
         content = message.get("content", "") or message.get("raw_message", "")
         match = re.search(r"<@!?(\d+)>|\[CQ:at,qq=(\d+)\]", content)
         if match:
@@ -218,16 +290,27 @@ class NewApiSuitePlugin(MaiBotPlugin):
         elif status in ("API_UNREACHABLE", "API_UPDATE_FAILED"):
             return "❌ 签到失败，无法连接或更新 NewAPI 系统额度。"
         elif status == "SUCCESS":
-            msg = "✨ 签到成功！✨\n"
-            added = details['display_added']
-            if details['is_first']:
-                msg += f"您获得了 {added:.2f} 额度 (已加入100额度新人礼包了哦！)\n"
-            elif details['is_doubled']:
-                msg += f"🎉 欧皇降临！奖励翻倍！获得了 {added:.2f} 额度！\n"
+            ci_conf = self.config.check_in
+            if details.get('is_first') and getattr(ci_conf, 'first_check_in_success_template', None):
+                tmpl = ci_conf.first_check_in_success_template
+            elif details.get('is_doubled') and getattr(ci_conf, 'check_in_doubled_template', None):
+                tmpl = ci_conf.check_in_doubled_template
             else:
-                msg += f"您获得了 {added:.2f} 额度！\n"
-            msg += f"当前剩余总额度为 {details['display_total']:.2f}。"
-            return msg
+                tmpl = getattr(ci_conf, 'check_in_success_template', "✨ 签到成功！✨\n您获得了 {display_added:.2f} 额度！\n当前剩余总额度为 {display_total:.2f}。")
+            try:
+                return tmpl.format(**details)
+            except Exception as e:
+                logger.warning(f"渲染签到模板失败: {e}，将使用内置格式")
+                added = details['display_added']
+                msg = "✨ 签到成功！✨\n"
+                if details['is_first']:
+                    msg += f"您获得了 {added:.2f} 额度 (已加入100额度新人礼包了哦！)\n"
+                elif details['is_doubled']:
+                    msg += f"🎉 欧皇降临！奖励翻倍！获得了 {added:.2f} 额度！\n"
+                else:
+                    msg += f"您获得了 {added:.2f} 额度！\n"
+                msg += f"当前剩余总额度为 {details['display_total']:.2f}。"
+                return msg
         return f"签到处理异常: {status}"
 
     @Command("查询余额", pattern=r"^/查询余额$")

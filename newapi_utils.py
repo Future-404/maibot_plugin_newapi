@@ -157,7 +157,8 @@ class NewApiCore:
         local_today = (datetime.utcnow() + time_delta).date()
         
         # 1. 检查签到记录
-        last_check_in_time = binding.get('last_check_in_time')
+        raw_last_time = binding.get('last_check_in_time')
+        last_check_in_time = raw_last_time
         if last_check_in_time:
             if isinstance(last_check_in_time, str):
                 try:
@@ -199,6 +200,7 @@ class NewApiCore:
         redemption_resp = await self.api_request("POST", "/api/redemption/", json_data=redemption_payload, custom_headers=admin_headers)
         if not redemption_resp or not redemption_resp.get("success") or not redemption_resp.get("data"):
             logger.error(f"❌ [NewAPI CheckIn] 用户 {qq_id} 生成兑换码失败: {redemption_resp}")
+            await self.restore_check_in_time(qq_id, raw_last_time)
             return "API_UNREACHABLE", {}
 
         code = redemption_resp.get("data")[0]
@@ -211,6 +213,7 @@ class NewApiCore:
         topup_resp = await self.api_request("POST", "/api/user/topup", json_data={"key": code}, custom_headers=user_headers)
         if not topup_resp or not topup_resp.get("success"):
             logger.error(f"❌ [NewAPI CheckIn] 用户 {qq_id} 核销卡密失败: {topup_resp}")
+            await self.restore_check_in_time(qq_id, raw_last_time)
             return "API_UPDATE_FAILED", {"site_id": website_user_id, "quota_owed": final_raw_quota}
 
         # 6. 查询最新余额
@@ -257,9 +260,18 @@ class NewApiCore:
         if website_user_id: return await self.execute_query("DELETE FROM newapi_bindings WHERE website_user_id = %s", (website_user_id,))
         return 0
 
-    async def set_check_in_time(self, qq_id: int) -> int:
-        query = "UPDATE newapi_bindings SET last_check_in_time = %s WHERE qq_id = %s"
-        return await self.execute_query(query, (datetime.utcnow().isoformat(), qq_id))
+    async def set_check_in_time(self, qq_id: int) -> None:
+        now_str = datetime.utcnow().isoformat()
+        await self.execute_query("UPDATE newapi_bindings SET last_check_in_time = %s WHERE qq_id = %s", (now_str, qq_id))
+
+    async def restore_check_in_time(self, qq_id: int, previous_time: Optional[Any]) -> None:
+        if previous_time is None:
+            query = "UPDATE newapi_bindings SET last_check_in_time = NULL WHERE qq_id = %s"
+            params = (qq_id,)
+        else:
+            query = "UPDATE newapi_bindings SET last_check_in_time = %s WHERE qq_id = %s"
+            params = (str(previous_time), qq_id)
+        await self.execute_query(query, params)
 
     async def revert_user_group(self, website_user_id: int) -> bool:
         api_user_data = await self.get_api_user_data(website_user_id)
