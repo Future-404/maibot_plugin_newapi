@@ -136,6 +136,15 @@ class NewApiSuitePlugin(MaiBotPlugin):
         except (ValueError, TypeError):
             return None
 
+    def _extract_stream_id(self, kwargs: Dict[str, Any], message: Dict[str, Any]) -> str:
+        if isinstance(kwargs, dict) and kwargs.get("stream_id"):
+            return str(kwargs["stream_id"])
+        if isinstance(message, dict):
+            sid = message.get("stream_id") or message.get("session_id") or message.get("channel_id")
+            if sid:
+                return str(sid)
+        return ""
+
     def _extract_mention(self, message: Dict[str, Any]) -> Optional[int]:
         content = message.get("content", "") or message.get("raw_message", "")
         match = re.search(r"<@!?(\d+)>|\[CQ:at,qq=(\d+)\]", content)
@@ -202,38 +211,47 @@ class NewApiSuitePlugin(MaiBotPlugin):
 
     @Command("查询余额", pattern=r"^/查询余额$")
     async def cmd_query_balance(self, **kwargs: Any):
-        stream_id = kwargs["stream_id"]
         message = kwargs.get("message", {})
+        stream_id = self._extract_stream_id(kwargs, message)
         if not self._permission_allowed(message):
             return True, "", 0
         user_id = self._extract_user_id(message)
         if user_id is None:
-            return True, "无法获取您的用户信息。", 2
+            text = "无法获取您的用户信息。"
+            if stream_id:
+                await self.ctx.send.text(text, stream_id)
+            return True, text, 2
         binding = await self.core.get_user_by_qq(user_id)
         if not binding:
             text = "您尚未绑定网站ID，无法进行此操作。\n请使用 `/绑定 [您的网站ID]` 指令。"
-            await self.ctx.send.text(text, stream_id)
+            if stream_id:
+                await self.ctx.send.text(text, stream_id)
             return True, text, 2
         api_user_data = await self.core.get_api_user_data(binding["website_user_id"])
         if not api_user_data:
             text = "查询失败，无法从网站获取余额信息。"
-            await self.ctx.send.text(text, stream_id)
+            if stream_id:
+                await self.ctx.send.text(text, stream_id)
             return True, text, 2
         ratio = self.config.binding.quota_display_ratio
         display_quota = api_user_data.get("quota", 0) / ratio
         text = f"查询成功！\n--------------------\n您绑定的网站ID: {binding['website_user_id']}\n当前剩余额度: {display_quota:.2f}"
-        await self.ctx.send.text(text, stream_id)
+        if stream_id:
+            await self.ctx.send.text(text, stream_id)
         return True, text, 2
 
     @Command("绑定", pattern=r"^/绑定\s+(?P<website_user_id>\d+)$")
     async def cmd_bind(self, **kwargs: Any):
-        stream_id = kwargs["stream_id"]
         message = kwargs.get("message", {})
+        stream_id = self._extract_stream_id(kwargs, message)
         if not self._permission_allowed(message):
             return True, "", 0
         user_id = self._extract_user_id(message)
         if user_id is None:
-            return True, "无法获取您的用户信息。", 2
+            text = "无法获取您的用户信息。"
+            if stream_id:
+                await self.ctx.send.text(text, stream_id)
+            return True, text, 2
         matched = kwargs.get("matched_groups", {})
         website_user_id = int(matched.get("website_user_id", "0"))
         error_message = (
@@ -242,37 +260,45 @@ class NewApiSuitePlugin(MaiBotPlugin):
             or await self._check_id_uniqueness(website_user_id)
         )
         if error_message:
-            await self.ctx.send.text(error_message, stream_id)
+            if stream_id:
+                await self.ctx.send.text(error_message, stream_id)
             return True, error_message, 2
-        await self.ctx.send.text("验证通过，执行绑定...", stream_id)
+        if stream_id:
+            await self.ctx.send.text("验证通过，执行绑定...", stream_id)
         success, message_text = await self._perform_binding_ritual(user_id, website_user_id)
-        await self.ctx.send.text(message_text, stream_id)
+        if stream_id:
+            await self.ctx.send.text(message_text, stream_id)
         return True, message_text, 2
 
     @Command("签到", pattern=r"^/签到$")
     async def cmd_checkin(self, **kwargs: Any):
-        stream_id = kwargs["stream_id"]
         message = kwargs.get("message", {})
+        stream_id = self._extract_stream_id(kwargs, message)
         if not self._permission_allowed(message):
             return True, "", 0
         user_id = self._extract_user_id(message)
         if user_id is None:
-            return True, "无法获取您的用户信息。", 2
+            text = "无法获取您的用户信息。"
+            if stream_id:
+                await self.ctx.send.text(text, stream_id)
+            return True, text, 2
         status, details = await self.core.perform_check_in(user_id)
         text = self._format_checkin_reply(status, details)
-        await self.ctx.send.text(text, stream_id)
+        if stream_id:
+            await self.ctx.send.text(text, stream_id)
         return True, text, 2
 
     @Command("解绑", pattern=r"^/解绑(?:\s+(?P<identifier>\d+))?$")
     async def cmd_unbind(self, **kwargs: Any):
-        stream_id = kwargs["stream_id"]
         message = kwargs.get("message", {})
+        stream_id = self._extract_stream_id(kwargs, message)
         if not self._permission_allowed(message):
             return True, "", 0
         user_id = self._extract_user_id(message)
         if not self._is_admin(user_id):
             text = "⛔ 权限不足。"
-            await self.ctx.send.text(text, stream_id)
+            if stream_id:
+                await self.ctx.send.text(text, stream_id)
             return True, text, 2
         matched = kwargs.get("matched_groups", {})
         identifier = self._extract_mention(message)
@@ -280,28 +306,32 @@ class NewApiSuitePlugin(MaiBotPlugin):
             identifier = int(matched["identifier"])
         if identifier is None:
             text = "格式错误。"
-            await self.ctx.send.text(text, stream_id)
+            if stream_id:
+                await self.ctx.send.text(text, stream_id)
             return True, text, 2
         id_type, binding = await self.core.lookup_binding(identifier)
         if id_type == "NOT_FOUND":
             text = "❌ 未找到绑定记录。"
-            await self.ctx.send.text(text, stream_id)
+            if stream_id:
+                await self.ctx.send.text(text, stream_id)
             return True, text, 2
         success, _ = await self.core.purge_user_binding(binding["website_user_id"])
         text = "✅ 解绑成功。" if success else "❌ 解绑失败。"
-        await self.ctx.send.text(text, stream_id)
+        if stream_id:
+            await self.ctx.send.text(text, stream_id)
         return True, text, 2
 
     @Command("查询", pattern=r"^/查询(?:\s+(?P<identifier>\d+))?$")
     async def cmd_lookup(self, **kwargs: Any):
-        stream_id = kwargs["stream_id"]
         message = kwargs.get("message", {})
+        stream_id = self._extract_stream_id(kwargs, message)
         if not self._permission_allowed(message):
             return True, "", 0
         user_id = self._extract_user_id(message)
         if not self._is_admin(user_id):
             text = "⛔ 权限不足。"
-            await self.ctx.send.text(text, stream_id)
+            if stream_id:
+                await self.ctx.send.text(text, stream_id)
             return True, text, 2
         matched = kwargs.get("matched_groups", {})
         identifier = self._extract_mention(message)
@@ -309,26 +339,29 @@ class NewApiSuitePlugin(MaiBotPlugin):
             identifier = int(matched["identifier"])
         if identifier is None:
             text = "格式错误。"
-            await self.ctx.send.text(text, stream_id)
+            if stream_id:
+                await self.ctx.send.text(text, stream_id)
             return True, text, 2
         id_type, binding = await self.core.lookup_binding(identifier)
         if id_type == "NOT_FOUND":
             text = "❌ 未找到。"
         else:
             text = f"✅ 查询成功！\n网站ID: {binding['website_user_id']}\n用户ID: {binding['qq_id']}"
-        await self.ctx.send.text(text, stream_id)
+        if stream_id:
+            await self.ctx.send.text(text, stream_id)
         return True, text, 2
 
     @Command("调整余额", pattern=r"^/调整余额\s+(?P<identifier>\d+)\s+(?P<display_adjustment>[+-]?\d+(\.\d+)?)$")
     async def cmd_adjust_balance(self, **kwargs: Any):
-        stream_id = kwargs["stream_id"]
         message = kwargs.get("message", {})
+        stream_id = self._extract_stream_id(kwargs, message)
         if not self._permission_allowed(message):
             return True, "", 0
         user_id = self._extract_user_id(message)
         if not self._is_admin(user_id):
             text = "⛔ 权限不足。"
-            await self.ctx.send.text(text, stream_id)
+            if stream_id:
+                await self.ctx.send.text(text, stream_id)
             return True, text, 2
         matched = kwargs.get("matched_groups", {})
         identifier = self._extract_mention(message)
@@ -336,7 +369,8 @@ class NewApiSuitePlugin(MaiBotPlugin):
             identifier = int(matched["identifier"])
         if identifier is None:
             text = "格式错误。"
-            await self.ctx.send.text(text, stream_id)
+            if stream_id:
+                await self.ctx.send.text(text, stream_id)
             return True, text, 2
         display_adjustment = float(matched.get("display_adjustment", "0"))
         status, details = await self.core.adjust_balance_by_identifier(identifier, display_adjustment)
@@ -344,7 +378,8 @@ class NewApiSuitePlugin(MaiBotPlugin):
             text = f"✅ 成功！当前余额: {details['new_display_quota']:.2f}"
         else:
             text = f"❌ 失败: {status}"
-        await self.ctx.send.text(text, stream_id)
+        if stream_id:
+            await self.ctx.send.text(text, stream_id)
         return True, text, 2
 
 
