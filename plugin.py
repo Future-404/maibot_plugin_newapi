@@ -9,6 +9,11 @@ from .newapi_utils import NewApiCore
 logger = logging.getLogger("newapi_suite")
 
 
+class PluginSection(PluginConfigBase):
+    enabled: bool = Field(default=True, description="是否启用插件")
+    config_version: str = Field(default="2.0.0", description="配置规范版本")
+
+
 class ApiSettings(PluginConfigBase):
     api_base_url: str = Field(default="", description="NewAPI 系统的基础 URL")
     api_access_token: str = Field(default="", description="全限 API Token (用于管理员操作)")
@@ -43,6 +48,7 @@ class OptionalPmSettings(PluginConfigBase):
 
 
 class NewApiSuiteConfig(PluginConfigBase):
+    plugin: PluginSection = Field(default_factory=PluginSection)
     api: ApiSettings = Field(default_factory=ApiSettings)
     permission: PermissionSettings = Field(default_factory=PermissionSettings)
     binding: BindingSettings = Field(default_factory=BindingSettings)
