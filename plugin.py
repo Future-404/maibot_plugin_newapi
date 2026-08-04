@@ -1,335 +1,184 @@
-import os
 import re
 import logging
-from typing import Any, Optional
+from typing import Any, Dict, Optional, Tuple, List
+from pydantic import Field
 
-from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, Field, MaiBotPlugin, PluginConfigBase
+from maibot_sdk import MaiBotPlugin, PluginConfigBase, Command
+from .newapi_utils import NewApiCore
 
 logger = logging.getLogger("newapi_suite")
 
 
-# ============================== 配置模型 ==============================
-
-class PluginSection(PluginConfigBase):
-    __ui_label__ = "插件基本设置"
-    __ui_icon__ = "settings"
-    __ui_order__ = -1
-
-    enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="2.0.0", description="配置版本")
-
-
 class ApiSettings(PluginConfigBase):
-    __ui_label__ = "NewAPI 连接设置"
-    __ui_icon__ = "link"
-    __ui_order__ = 0
-
-    api_base_url: str = Field(default="", description="NewAPI 站点地址（如 http://your-api-domain:port）")
-    api_access_token: str = Field(default="", description="API 访问令牌")
-    api_admin_user_id: str = Field(default="1", description="请求 API 时使用的管理员用户 ID")
+    api_base_url: str = Field(default="", description="NewAPI 系统的基础 URL")
+    api_access_token: str = Field(default="", description="全限 API Token (用于管理员操作)")
+    api_admin_user_id: str = Field(default="1", description="拥有管理员权限的 User-ID Header")
 
 
 class PermissionSettings(PluginConfigBase):
-    __ui_label__ = "权限控制设置"
-    __ui_icon__ = "shield"
-    __ui_order__ = 1
-
-    admin_list: list[int] = Field(default_factory=list, description="管理员 ID 列表")
-    allowed_groups: list[str] = Field(default_factory=list, description="允许生效的频道列表，留空则允许所有群聊")
-    enable_private_chat: bool = Field(default=True, description="允许私聊触发")
+    mode: str = Field(default="all", description="运行模式: all / whitelist / blacklist")
+    whitelist: List[str] = Field(default_factory=list, description="白名单列表")
+    blacklist: List[str] = Field(default_factory=list, description="黑名单列表")
+    admin_users: List[int] = Field(default_factory=list, description="超级管理员 ID 列表")
 
 
 class BindingSettings(PluginConfigBase):
-    __ui_label__ = "核心绑定设置"
-    __ui_icon__ = "link"
-    __ui_order__ = 2
-
-    binding_group: str = Field(default="default", description="自动设置的分组")
-    quota_display_ratio: int = Field(default=500000, description="额度转换比例（显示额度 = quota / ratio）")
+    binding_group: str = Field(default="vip", description="绑定成功后赋予的组别")
+    unbind_group: str = Field(default="default", description="解绑后复原的组别")
+    quota_display_ratio: float = Field(default=500000.0, description="额度展示比例")
 
 
 class CheckInSettings(PluginConfigBase):
-    __ui_label__ = "签到功能设置"
-    __ui_icon__ = "calendar"
-    __ui_order__ = 3
-
-    enabled: bool = Field(default=True, description="启用 /签到")
+    enabled: bool = Field(default=True, description="是否启用签到功能")
     timezone_offset_hours: int = Field(default=8, description="时区偏移")
-    min_display_quota: float = Field(default=1500.0, description="最小奖励")
-    max_display_quota: float = Field(default=1500.0, description="最大奖励")
-    double_chance: float = Field(default=0.1, description="双倍概率")
-    first_check_in_bonus_enabled: bool = Field(default=True, description="新人礼包")
-    first_check_in_bonus_display_quota: float = Field(default=2.0, description="新人奖励额度")
-    check_in_success_template: str = Field(
-        default="签到成功！您获得了 {display_added} 额度，当前剩余总额度为 {display_total}。",
-        description="成功模板",
-    )
-    check_in_doubled_template: str = Field(
-        default="🎉 好运连连！签到成功并触发了双倍奖励！🎉\n\n您获得了 {display_added} 额度，当前剩余总额度为 {display_total}。",
-        description="双倍模板",
-    )
-    first_check_in_success_template: str = Field(
-        default="✨ 欢迎您的第一次签到！✨\n\n您获得了 {display_added} 额度 (内含一份额外新人礼包哦！)\n当前剩余总额度为 {display_total}。",
-        description="新人模板",
-    )
-
-
-class HeistSettings(PluginConfigBase):
-    __ui_label__ = "打劫互动设置"
-    __ui_icon__ = "swords"
-    __ui_order__ = 4
-
-    enabled: bool = Field(default=True, description="启用 /打劫")
-    max_attempts_per_day: int = Field(default=1, description="每日发起上限")
-    max_defenses_per_day: int = Field(default=3, description="每日被劫上限")
-    min_amount: float = Field(default=5.0, description="最小劫掠额度")
-    max_amount: float = Field(default=40.0, description="最大劫掠额度")
-    critical_chance: float = Field(default=0.1, description="暴击概率")
-    failure_chance: float = Field(default=0.5, description="失败概率")
-    failure_penalty: float = Field(default=100.0, description="失败赔偿额度")
-    cooldown_seconds: int = Field(default=3600, description="冷却时间(秒)")
-    success_template: str = Field(default="✅ 打劫成功！你悄悄地从对方口袋里摸走了 {gain:.2f} 额度。", description="成功模板")
-    critical_template: str = Field(default="🎉 暴击！你的手法如此娴熟，居然摸走了双倍的 {gain:.2f} 额度！", description="暴击模板")
-    failure_template: str = Field(default="💥 失手了！你在打劫时笨手笨脚，反被对方揍了一顿，赔偿了 {penalty:.2f} 额度。", description="失败模板")
-    attempts_exceeded_template: str = Field(default="🥵 你今天已经打劫累了，先去歇会儿吧，明天再来。", description="次数超限模板")
-    defenses_exceeded_template: str = Field(default="🛡️ 对方(ID:{victim_id})今天已经被打劫太多次了，看起来已经有了防备，换个目标吧。", description="防御超限模板")
-    victim_not_found_template: str = Field(default="💨 你朝着空气挥舞拳头，但并没有找到ID为 {victim_identifier} 的目标。", description="目标未找到模板")
-    cannot_rob_self_template: str = Field(default="🤦‍♂️ 你不能打劫你自己，这毫无意义！", description="不能自劫模板")
-    robber_not_bound_template: str = Field(default="🤔 你自己都还没绑定账号，抢来的钱往哪儿放呢？快去 /绑定 吧！", description="未绑定模板")
-    cooldown_template: str = Field(default="⏳ 你刚刚打劫完，正在被官府通缉呢！先躲一会儿吧，还剩 {remaining_time} 秒才能再次行动。", description="冷却提示模板")
+    min_display_quota: float = Field(default=0.1, description="签到最小额度")
+    max_display_quota: float = Field(default=10.0, description="签到最大额度")
+    double_chance: float = Field(default=0.1, description="翻倍概率")
+    first_check_in_bonus_enabled: bool = Field(default=True, description="首次签到奖励")
+    first_check_in_bonus_display_quota: float = Field(default=100.0, description="首次签到额外额度")
 
 
 class OptionalPmSettings(PluginConfigBase):
-    __ui_label__ = "可选通知设置"
-    __ui_icon__ = "mail"
-    __ui_order__ = 5
-
-    enable_bind_success_pm: bool = Field(default=True, description="绑定成功私信")
-    bind_success_pm_template: str = Field(default="绑定成功！", description="私信模板")
+    enable_all_pm: bool = Field(default=False, description="是否允许所有私聊指令")
 
 
 class NewApiSuiteConfig(PluginConfigBase):
-    __ui_label__ = "NewAPI 插件套件"
-    __ui_icon__ = "wallet"
-
-    plugin: PluginSection = Field(default_factory=PluginSection)
     api: ApiSettings = Field(default_factory=ApiSettings)
     permission: PermissionSettings = Field(default_factory=PermissionSettings)
     binding: BindingSettings = Field(default_factory=BindingSettings)
     check_in: CheckInSettings = Field(default_factory=CheckInSettings)
-    heist: HeistSettings = Field(default_factory=HeistSettings)
-    optional_pm: OptionalPmSettings = Field(default_factory=OptionalPmSettings)
+    pm: OptionalPmSettings = Field(default_factory=OptionalPmSettings)
 
-
-# ============================== 插件主体 ==============================
 
 class NewApiSuitePlugin(MaiBotPlugin):
     config_model = NewApiSuiteConfig
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self.core: Optional["NewApiCore"] = None
-        self.heist_handler: Optional["HeistLogic"] = None
-
-    # ---------- 生命周期 ----------
+        self._plugin_config_instance = NewApiSuiteConfig()
+        self.core: Optional[NewApiCore] = None
 
     async def on_load(self) -> None:
-        self.ctx.logger.info("NewAPI 插件套件加载中...")
-        from .newapi_utils import NewApiCore
-        from .heist_logic import HeistLogic
+        raw_config = self.ctx.config or {}
+        try:
+            if raw_config:
+                self._plugin_config_instance = NewApiSuiteConfig(**raw_config)
+        except Exception as e:
+            logger.warning(f"⚠️ [NewAPI Plugin] 加载 WebUI 配置失败: {e}，将使用默认配置。")
+            self._plugin_config_instance = NewApiSuiteConfig()
 
-        self.core = NewApiCore(self, data_dir=str(self.ctx.paths.data_dir))
+        data_dir = str(self.ctx.paths.data_dir)
+        self.core = NewApiCore(self, data_dir=data_dir)
         init_ok = await self.core.initialize()
-        self.heist_handler = HeistLogic(self, self.core)
-        if not init_ok:
-            self.ctx.logger.warning("插件已加载，但 API 连接配置不完整，请在 WebUI 配置后使用")
-        self.ctx.logger.info("NewAPI 插件套件初始化完成")
+        if init_ok:
+            logger.info("🚀 [NewAPI Plugin] NewAPI 核心引擎初始化成功！")
+        else:
+            logger.warning("⚠️ [NewAPI Plugin] NewAPI 核心引擎初始化存在异常或 API 未配置。")
 
     async def on_unload(self) -> None:
-        self.ctx.logger.info("NewAPI 插件套件已卸载")
+        logger.info("🛑 [NewAPI Plugin] NewAPI 插件套件已安全卸载。")
 
-    async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
-        if scope == CONFIG_RELOAD_SCOPE_SELF:
-            self.ctx.logger.info("插件配置已更新: version=%s", version)
-            if self.core is not None:
+    async def on_config_update(self, new_config: Dict[str, Any]) -> None:
+        try:
+            self._plugin_config_instance = NewApiSuiteConfig(**new_config)
+            if self.core:
                 self.core.refresh_config()
+            logger.info("✅ [NewAPI Plugin] 插件配置已动态更新。")
+        except Exception as e:
+            logger.error(f"❌ [NewAPI Plugin] 动态更新配置失败: {e}")
 
-    # ---------- 消息辅助 ----------
+    def _is_admin(self, user_id: int) -> bool:
+        return user_id in self.config.permission.admin_users
 
-    @staticmethod
-    def _extract_user_id(message: dict) -> Optional[int]:
-        """从消息对象中兼容提取用户 ID。"""
-        candidates = []
+    def _permission_allowed(self, message: Dict[str, Any]) -> bool:
+        perm = self.config.permission
+        channel_id = str(message.get("channel_id", ""))
+        message_type = message.get("type", "")
+
+        if message_type == "private":
+            if self.config.pm.enable_all_pm:
+                return True
+            user_id = self._extract_user_id(message)
+            return user_id is not None and self._is_admin(user_id)
+
+        if perm.mode == "whitelist":
+            return channel_id in perm.whitelist
+        elif perm.mode == "blacklist":
+            return channel_id not in perm.blacklist
+        return True
+
+    def _extract_user_id(self, message: Dict[str, Any]) -> Optional[int]:
+        user_info = message.get("user", {})
+        sender = message.get("sender", {})
+        uid = user_info.get("id") or sender.get("user_id") or message.get("user_id")
         try:
-            candidates.append(message.get("user_info", {}).get("user_id"))
-        except AttributeError:
-            pass
-        try:
-            candidates.append(message.get("message_info", {}).get("user_info", {}).get("user_id"))
-        except AttributeError:
-            pass
-        try:
-            candidates.append(message.get("message_base_info", {}).get("user_id"))
-        except AttributeError:
-            pass
-        for value in candidates:
-            if value is not None:
-                try:
-                    return int(value)
-                except (TypeError, ValueError):
-                    continue
-        return None
-
-    @staticmethod
-    def _extract_mention(message: dict) -> Optional[int]:
-        """从消息段中查找 @提及 目标用户 ID。"""
-        segments = message.get("message_segments", []) if isinstance(message, dict) else []
-
-        def walk(items):
-            for segment in items:
-                if not isinstance(segment, dict):
-                    continue
-                seg_type = segment.get("type", "")
-                data = segment.get("data") or {}
-                if seg_type in ("at", "mention", "seg"):
-                    for key in ("user_id", "target_user_id"):
-                        value = data.get(key)
-                        if value is not None:
-                            try:
-                                return int(value)
-                            except (TypeError, ValueError):
-                                pass
-                    users = data.get("users") or []
-                    if users and users[0].get("user_id") is not None:
-                        try:
-                            return int(users[0]["user_id"])
-                        except (TypeError, ValueError):
-                            pass
-                if seg_type == "seglist" and isinstance(data, list):
-                    result = walk(data)
-                    if result:
-                        return result
+            return int(uid) if uid is not None else None
+        except (ValueError, TypeError):
             return None
 
-        return walk(segments)
-
-    @staticmethod
-    def _is_group_message(message: dict) -> bool:
-        try:
-            if message.get("is_group_message"):
-                return True
-        except AttributeError:
-            pass
-        base_info = message.get("message_base_info", {}) or {}
-        return bool(base_info.get("group_id"))
-
-    def _get_group_id(self, message: dict) -> Optional[str]:
-        base_info = message.get("message_base_info", {}) or {}
-        group_id = base_info.get("group_id")
-        if group_id is not None:
-            return str(group_id)
-        try:
-            group_info = message.get("message_info", {}).get("group_info", {}) or {}
-            group_id = group_info.get("group_id")
-            if group_id is not None:
-                return str(group_id)
-        except AttributeError:
-            pass
+    def _extract_mention(self, message: Dict[str, Any]) -> Optional[int]:
+        content = message.get("content", "") or message.get("raw_message", "")
+        match = re.search(r"<@!?(\d+)>|\[CQ:at,qq=(\d+)\]", content)
+        if match:
+            uid_str = match.group(1) or match.group(2)
+            try:
+                return int(uid_str)
+            except (ValueError, TypeError):
+                return None
         return None
 
-    def _permission_allowed(self, message: dict) -> bool:
-        """频道/私聊权限校验。"""
-        permission = self.config.permission
-        if self._is_group_message(message):
-            allowed = [str(g) for g in permission.allowed_groups]
-            if allowed:
-                group_id = self._get_group_id(message)
-                return bool(group_id) and group_id in allowed
-            return True
-        return bool(permission.enable_private_chat)
-
-    def _is_admin(self, user_id: Optional[int]) -> bool:
-        if user_id is None:
-            return False
-        admin_list = [str(a) for a in self.config.permission.admin_list]
-        return str(user_id) in admin_list
-
-    # ---------- 绑定校验辅助 ----------
-
     async def _check_self_binding(self, user_id: int) -> Optional[str]:
-        if binding := await self.core.get_user_by_qq(user_id):
-            return f"您好，您已绑定网站ID {binding['website_user_id']}。"
+        existing = await self.core.get_user_by_qq(user_id)
+        if existing:
+            return f"❌ 您已经绑定了网站ID: {existing['website_user_id']}，无需重复绑定。"
         return None
 
     async def _check_api_user_exists(self, website_user_id: int) -> Optional[str]:
-        if not await self.core.get_api_user_data(website_user_id):
-            return f"网站中不存在ID为 {website_user_id} 的用户。"
+        api_data = await self.core.get_api_user_data(website_user_id)
+        if not api_data:
+            return f"❌ 找不到网站ID为 {website_user_id} 的用户，请检查ID是否正确。"
         return None
 
     async def _check_id_uniqueness(self, website_user_id: int) -> Optional[str]:
-        if await self.core.get_user_by_website_id(website_user_id):
-            return f"ID {website_user_id} 已被他人绑定。"
+        bound = await self.core.get_user_by_website_id(website_user_id)
+        if bound:
+            return f"❌ 网站ID {website_user_id} 已被其他用户绑定。"
         return None
 
-    async def _perform_binding_ritual(self, user_id: int, website_user_id: int) -> tuple[bool, str]:
-        try:
-            await self.core.insert_binding(user_id, website_user_id)
-            return True, f"✅ 绑定成功！网站ID {website_user_id} 现在与您的账号关联了。"
-        except Exception as exc:
-            return False, f"发生错误: {exc}"
+    async def _perform_binding_ritual(self, user_id: int, website_user_id: int) -> Tuple[bool, str]:
+        api_user_data = await self.core.get_api_user_data(website_user_id)
+        if not api_user_data:
+            return False, "❌ 绑定失败，无法获取账户信息。"
 
-    # ---------- 回复格式化 ----------
+        target_group = self.config.binding.binding_group
+        api_user_data["group"] = target_group
+        await self.core.update_api_user(api_user_data)
+        await self.core.insert_binding(user_id, website_user_id)
 
-    def _format_checkin_reply(self, status: str, details: dict) -> str:
-        if status == "SUCCESS":
-            check_in = self.config.check_in
-            if details.get("is_first"):
-                template = check_in.first_check_in_success_template
-            elif details.get("is_doubled"):
-                template = check_in.check_in_doubled_template
+        msg = f"🎉 绑定成功！\n网站ID: {website_user_id}\n专属分组: {target_group}"
+        return True, msg
+
+    def _format_checkin_reply(self, status: str, details: Dict[str, Any]) -> str:
+        if status == "NOT_BOUND":
+            return "您尚未绑定网站ID，无法签到。\n请使用 `/绑定 [您的网站ID]` 指令。"
+        elif status == "ALREADY_CHECKED_IN":
+            return "您今天已经签到过了，明天再来吧！"
+        elif status == "DISABLED":
+            return "签到功能暂未开启。"
+        elif status in ("API_UNREACHABLE", "API_UPDATE_FAILED"):
+            return "❌ 签到失败，无法连接或更新 NewAPI 系统额度。"
+        elif status == "SUCCESS":
+            msg = "✨ 签到成功！✨\n"
+            added = details['display_added']
+            if details['is_first']:
+                msg += f"您获得了 {added:.2f} 额度 (已加入100额度新人礼包了哦！)\n"
+            elif details['is_doubled']:
+                msg += f"🎉 欧皇降临！奖励翻倍！获得了 {added:.2f} 额度！\n"
             else:
-                template = check_in.check_in_success_template
-            return template.format(
-                display_added=f"{details['display_added']:.2f}",
-                display_total=f"{details['display_total']:.2f}",
-                user_id=details["user_id"],
-                site_id=details["site_id"],
-            )
-        if status == "ALREADY_CHECKED_IN":
-            return "❌ 您今天已经签过到了，请明天再来吧！"
-        if status == "API_UNREACHABLE":
-            return "❌ 无法连接到服务器，额度已在本地锁定，请联系管理员。"
-        return f"❓ 签到失败: {status}"
-
-    def _format_heist_reply(self, status: str, details: dict, victim_name: str) -> str:
-        heist = self.config.heist
-        if status == "SUCCESS":
-            return heist.success_template.format(gain=details["gain"])
-        if status == "CRITICAL":
-            return heist.critical_template.format(gain=details["gain"])
-        if status == "FAILURE":
-            return heist.failure_template.format(penalty=details["penalty"])
-        if status == "COOLDOWN_ACTIVE":
-            return heist.cooldown_template.format(remaining_time=details["remaining_time"])
-        if status == "ROBBER_NOT_BOUND":
-            return heist.robber_not_bound_template
-        if status == "VICTIM_NOT_FOUND":
-            return heist.victim_not_found_template.format(victim_identifier=victim_name)
-        if status == "ATTEMPTS_EXCEEDED":
-            return heist.attempts_exceeded_template
-        if status == "DEFENSES_EXCEEDED":
-            return heist.defenses_exceeded_template.format(victim_id=victim_name)
-        return f"行动结果: {status}"
-
-    # ---------- 命令 ----------
-
-    @Command("pingapi", pattern=r"^/pingapi$")
-    async def cmd_pingapi(self, **kwargs: Any):
-        stream_id = kwargs["stream_id"]
-        db_status = "✅ 已连接" if os.path.exists(self.core.db_path) else "❓ 数据库文件未就绪"
-        text = f"🎉 Pong! NewAPI 插件套件 V2.0.0 正在运行！\n--------------------\n数据库状态: {db_status}"
-        await self.ctx.send.text(text, stream_id)
-        return True, text, 2
+                msg += f"您获得了 {added:.2f} 额度！\n"
+            msg += f"当前剩余总额度为 {details['display_total']:.2f}。"
+            return msg
+        return f"签到处理异常: {status}"
 
     @Command("查询余额", pattern=r"^/查询余额$")
     async def cmd_query_balance(self, **kwargs: Any):
@@ -391,25 +240,6 @@ class NewApiSuitePlugin(MaiBotPlugin):
             return True, "无法获取您的用户信息。", 2
         status, details = await self.core.perform_check_in(user_id)
         text = self._format_checkin_reply(status, details)
-        await self.ctx.send.text(text, stream_id)
-        return True, text, 2
-
-    @Command("打劫", pattern=r"^/打劫")
-    async def cmd_heist(self, **kwargs: Any):
-        stream_id = kwargs["stream_id"]
-        message = kwargs.get("message", {})
-        if not self._permission_allowed(message):
-            return True, "", 0
-        robber_user_id = self._extract_user_id(message)
-        if robber_user_id is None:
-            return True, "无法获取您的用户信息。", 2
-        victim_user_id = self._extract_mention(message)
-        if victim_user_id is None:
-            text = "🤔 打劫谁呢？请 @ 你要打劫的目标。"
-            await self.ctx.send.text(text, stream_id)
-            return True, text, 2
-        status, details = await self.heist_handler.execute_heist(robber_user_id, victim_user_id)
-        text = self._format_heist_reply(status, details, str(victim_user_id))
         await self.ctx.send.text(text, stream_id)
         return True, text, 2
 

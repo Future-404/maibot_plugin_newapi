@@ -11,7 +11,7 @@ logger = logging.getLogger("newapi_suite")
 
 class NewApiCore:
     """
-    NewAPI 核心工具类 (SQLite 高可靠原子化模式)。
+    NewAPI 核心工具类 (SQLite 原子锁 + 兑换码真实加额度模式)。
     """
     def __init__(self, plugin, data_dir: Optional[str] = None):
         self.plugin = plugin
@@ -26,7 +26,6 @@ class NewApiCore:
 
     @staticmethod
     def _load_env_file(path: str) -> Dict[str, str]:
-        """极简 .env 解析（避免引入第三方依赖）。"""
         env: Dict[str, str] = {}
         if not os.path.exists(path):
             return env
@@ -40,29 +39,25 @@ class NewApiCore:
         return env
 
     async def initialize(self) -> bool:
-        """异步初始化：先建表，再检查 API 配置。"""
         self.refresh_config()
-        # 数据库表始终初始化，不依赖 API 配置是否完整
         try:
             os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
             await asyncio.to_thread(self._ensure_tables_exist_sync)
-            logger.info("✅ [NewAPI Utils] SQLite 数据库原子化配置已就绪 (WAL Mode Enabled)。")
+            logger.info("✅ [NewAPI Utils] SQLite 数据库配置已就绪。")
         except Exception as e:
             logger.error("❌ [NewAPI Utils] 数据库初始化失败: %s", e, exc_info=True)
             return False
         if not self.api_base_url or not self.api_access_token:
-            logger.warning("[NewAPI Utils] API 配置不完整，功能暂不可用。请在 WebUI 或 config.toml 中配置 api_base_url / api_access_token。")
+            logger.warning("[NewAPI Utils] API 配置不完整，请在 WebUI 或 config.toml/.env 中配置")
             return False
         return True
 
     def refresh_config(self) -> None:
-        """重新读取 API 连接配置（配置热重载时调用）。"""
         config = self.plugin.config.api
         self.api_base_url = config.api_base_url or ""
         self.api_access_token = config.api_access_token or ""
         self.api_admin_user_id = config.api_admin_user_id or "1"
 
-        # 兼容旧版：config 中未配置时，回退读取插件目录 .env
         if not self.api_base_url or not self.api_access_token:
             env = self._load_env_file(os.path.join(os.path.dirname(__file__), ".env"))
             self.api_base_url = self.api_base_url or env.get("API_BASE_URL", "")
@@ -70,77 +65,49 @@ class NewApiCore:
             self.api_admin_user_id = self.api_admin_user_id or env.get("API_ADMIN_USER_ID", "1")
 
     def _ensure_tables_exist_sync(self):
-        """同步方法：开启 WAL 模式并确认表结构。"""
         with sqlite3.connect(self.db_path) as conn:
-            # 开启 WAL 模式：极大地提高并发读写性能，减少锁表概率
-            conn.execute("PRAGMA journal_mode=WAL;")
             cursor = conn.cursor()
-            
-            # 1. 用户绑定信息表
+            cursor.execute("PRAGMA journal_mode=WAL;")
             cursor.execute("""
-            CREATE TABLE IF NOT EXISTS `newapi_bindings` (
-              `id` INTEGER PRIMARY KEY AUTOINCREMENT,
-              `qq_id` BIGINT NOT NULL UNIQUE,
-              `website_user_id` INTEGER NOT NULL UNIQUE,
-              `binding_time` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-              `last_check_in_time` TIMESTAMP DEFAULT NULL
-            );
-            """)
-            
-            # 2. 每日打劫日志表
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS `daily_heist_log` (
-              `id` INTEGER PRIMARY KEY AUTOINCREMENT,
-              `robber_qq_id` BIGINT NOT NULL,
-              `victim_website_id` INTEGER NOT NULL,
-              `heist_time` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-              `outcome` VARCHAR(10) NOT NULL,
-              `amount` INTEGER NOT NULL
-            );
-            """)
-            
-            # 3. 待处理任务表 (用于分布式事务补偿)
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS `pending_api_tasks` (
-              `id` INTEGER PRIMARY KEY AUTOINCREMENT,
-              `task_type` VARCHAR(20) NOT NULL,
-              `payload` TEXT NOT NULL,
-              `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-              `status` VARCHAR(10) DEFAULT 'PENDING'
-            );
+                CREATE TABLE IF NOT EXISTS newapi_bindings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    qq_id INTEGER UNIQUE NOT NULL,
+                    website_user_id INTEGER NOT NULL,
+                    binding_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_check_in_time TIMESTAMP
+                )
             """)
             conn.commit()
 
-    async def execute_query(self, query: str, args: Optional[Tuple] = None, fetch: Optional[str] = None) -> Any:
-        """异步执行 SQLite 查询。"""
-        return await asyncio.to_thread(self._execute_query_sync, query, args, fetch)
+    async def execute_query(self, query: str, params: Tuple = (), fetch: str = 'none') -> Any:
+        def _sync_op():
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                q = query.replace('%s', '?')
+                cursor.execute(q, params)
+                if fetch == 'one':
+                    row = cursor.fetchone()
+                    return dict(row) if row else None
+                elif fetch == 'all':
+                    return [dict(r) for r in cursor.fetchall()]
+                else:
+                    conn.commit()
+                    return cursor.rowcount
+        return await asyncio.to_thread(_sync_op)
 
-    def _execute_query_sync(self, query: str, args: Optional[Tuple], fetch: Optional[str]) -> Any:
-        """同步执行 SQLite 查询的内部方法。"""
-        def dict_factory(cursor, row):
-            d = {}
-            for idx, col in enumerate(cursor.description):
-                d[col[0]] = row[idx]
-            return d
-
-        with sqlite3.connect(self.db_path) as conn:
-            if fetch: conn.row_factory = dict_factory
-            cursor = conn.cursor()
-            sqlite_query = query.replace("%s", "?")
-            cursor.execute(sqlite_query, args or ())
-            
-            if fetch == 'one': return cursor.fetchone()
-            elif fetch == 'all': return cursor.fetchall()
-            
-            conn.commit()
-            return cursor.rowcount
-
-    async def api_request(self, method: str, endpoint: str, json_data: Optional[Dict] = None) -> Optional[Dict]:
-        if not self.api_base_url or not self.api_access_token: return None
+    async def api_request(self, method: str, endpoint: str, json_data: Optional[Dict] = None, custom_headers: Optional[Dict] = None) -> Optional[Dict]:
+        if not self.api_base_url or not self.api_access_token:
+            return None
         url = f"{self.api_base_url}{endpoint}"
-        headers = { "Authorization": self.api_access_token, "New-Api-User": self.api_admin_user_id }
+        token = self.api_access_token
+        auth_header = token if token.startswith("Bearer ") else f"Bearer {token}"
+        headers = custom_headers or {
+            "Authorization": auth_header,
+            "New-Api-User": str(self.api_admin_user_id)
+        }
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
                 response = await client.request(method, url, headers=headers, json=json_data, timeout=15.0)
                 response.raise_for_status()
                 return response.json()
@@ -148,25 +115,30 @@ class NewApiCore:
             logger.error(f"[NewAPI Utils] API 请求异常 ({endpoint}): {e}")
             return None
 
-    # --- 高可靠性核心方法 ---
+    # --- 核心签到发放逻辑 ---
 
     async def perform_check_in(self, qq_id: int, binding: Optional[Dict] = None) -> Tuple[str, Dict[str, Any]]:
-        """执行签到 (原子化优化版本)。"""
+        """执行签到 (通过卡密生成与自动核销真实增加额度)"""
         check_in_conf = self.plugin.config.check_in
-        if not check_in_conf.enabled: return "DISABLED", {}
-        if not binding: binding = await self.get_user_by_qq(qq_id)
-        if not binding: return "NOT_BOUND", {}
+        if not check_in_conf.enabled:
+            return "DISABLED", {}
+        if not binding:
+            binding = await self.get_user_by_qq(qq_id)
+        if not binding:
+            return "NOT_BOUND", {}
 
         offset_hours = check_in_conf.timezone_offset_hours
         time_delta = timedelta(hours=offset_hours)
         local_today = (datetime.utcnow() + time_delta).date()
         
-        # 1. 检查签到记录 (读)
+        # 1. 检查签到记录
         last_check_in_time = binding.get('last_check_in_time')
         if last_check_in_time:
             if isinstance(last_check_in_time, str):
-                try: last_check_in_time = datetime.fromisoformat(last_check_in_time.replace('Z', '+00:00'))
-                except: pass
+                try:
+                    last_check_in_time = datetime.fromisoformat(last_check_in_time.replace('Z', '+00:00'))
+                except:
+                    pass
             if (last_check_in_time + time_delta).date() == local_today:
                 return "ALREADY_CHECKED_IN", {}
 
@@ -180,70 +152,56 @@ class NewApiCore:
             if is_first and check_in_conf.first_check_in_bonus_enabled
             else 0
         )
-        final_quota = int(base_display_quota * ratio) * (2 if is_doubled else 1) + bonus_quota
+        final_raw_quota = int(base_display_quota * ratio) * (2 if is_doubled else 1) + bonus_quota
 
-        # 3. 【核心变更】先写本地数据库锁定状态
-        # 即使 API 后面挂了，数据库已经记录了用户今天签过到，防止“回滚失败导致的刷钱”
+        # 3. 先写本地数据库锁定状态 (防刷)
         await self.set_check_in_time(qq_id)
-        logger.info(f"[NewAPI CheckIn] 用户 {qq_id} 已在本地锁定签到状态，准备请求 API。")
+        logger.info(f"[NewAPI CheckIn] 用户 {qq_id} 已在本地锁定签到状态，准备充值发放额度: {final_raw_quota}")
 
-        # 4. 请求 API 发放奖励
-        api_user_data = await self.get_api_user_data(binding['website_user_id'])
-        if not api_user_data:
-            # 补偿逻辑：如果连查询都失败，本地记录其实已经存了，用户无法重试。
-            # 这在安全性上是 100% 的，只是用户体验可能变差。
+        # 4. 生成卡密
+        website_user_id = binding['website_user_id']
+        token = self.api_access_token
+        auth_header = token if token.startswith("Bearer ") else f"Bearer {token}"
+        admin_headers = {
+            "Authorization": auth_header,
+            "New-Api-User": str(self.api_admin_user_id)
+        }
+        redemption_payload = {
+            "name": f"checkin_{website_user_id}_{int(datetime.utcnow().timestamp())}",
+            "quota": final_raw_quota,
+            "count": 1
+        }
+        redemption_resp = await self.api_request("POST", "/api/redemption/", json_data=redemption_payload, custom_headers=admin_headers)
+        if not redemption_resp or not redemption_resp.get("success") or not redemption_resp.get("data"):
+            logger.error(f"❌ [NewAPI CheckIn] 用户 {qq_id} 生成兑换码失败: {redemption_resp}")
             return "API_UNREACHABLE", {}
 
-        api_user_data["quota"] = api_user_data.get("quota", 0) + final_quota
-        if not await self.update_api_user(api_user_data):
-            logger.error(f"❌ [Critical] 用户 {qq_id} 签到 API 更新失败！金额: {final_quota}。用户已无法重试。")
-            return "API_UPDATE_FAILED", {"site_id": binding['website_user_id'], "quota_owed": final_quota}
-            
-        return "SUCCESS", {"is_first": last_check_in_time is None, "is_doubled": is_doubled, "display_added": final_quota / ratio, "display_total": api_user_data["quota"] / ratio, "user_id": qq_id, "site_id": binding['website_user_id']}
+        code = redemption_resp.get("data")[0]
 
-    async def _transfer_quota(self, from_user_id: int, to_user_id: int, raw_amount: int, allow_partial: bool = False) -> Tuple[bool, int]:
-        """资金转移 (增强稳健性版本)。"""
-        # 由于远程 API 不支持原子跨账户，我们采用“双向确认”逻辑
-        from_user = await self.get_api_user_data(from_user_id)
-        to_user = await self.get_api_user_data(to_user_id)
-        if not from_user or not to_user: return False, 0
-        
-        actual_amount = min(raw_amount, from_user.get("quota", 0)) if allow_partial else raw_amount
-        if actual_amount <= 0 or (not allow_partial and from_user.get("quota", 0) < raw_amount):
-            return (actual_amount == 0), 0
+        # 5. 自动以用户身份核销卡密
+        user_headers = {
+            "Authorization": auth_header,
+            "New-Api-User": str(website_user_id)
+        }
+        topup_resp = await self.api_request("POST", "/api/user/topup", json_data={"key": code}, custom_headers=user_headers)
+        if not topup_resp or not topup_resp.get("success"):
+            logger.error(f"❌ [NewAPI CheckIn] 用户 {qq_id} 核销卡密失败: {topup_resp}")
+            return "API_UPDATE_FAILED", {"site_id": website_user_id, "quota_owed": final_raw_quota}
 
-        # 步骤 1：从发起者账户扣款
-        from_user["quota"] -= actual_amount
-        if not await self.update_api_user(from_user):
-            return False, 0
-        
-        # 步骤 2：尝试向接收者账户加款
-        to_user["quota"] += actual_amount
-        if not await self.update_api_user(to_user):
-            # 【关键优化】如果加款失败，尝试 3 次重试回滚，如果都失败，记录到 pending_api_tasks
-            logger.error(f"💥 [DANGER] 转移失败！扣款成功但加款失败。From:{from_user_id} To:{to_user_id} Amt:{actual_amount}")
-            
-            rollback_success = False
-            for i in range(3):
-                from_user["quota"] += actual_amount
-                if await self.update_api_user(from_user):
-                    rollback_success = True
-                    break
-                await asyncio.sleep(1)
-            
-            if not rollback_success:
-                # 终极保底：写入本地待处理任务，人工介入或自动补偿
-                await self.execute_query(
-                    "INSERT INTO pending_api_tasks (task_type, payload) VALUES (%s, %s)",
-                    ("RECOVERY_REFUND", f"from:{from_user_id},to:{to_user_id},amt:{actual_amount}")
-                )
-                logger.error("🛑 [FATAL] 回滚也失败了！已记录至 pending_api_tasks 待人工处理。")
-            
-            return False, 0
-            
-        return True, actual_amount
+        # 6. 查询最新余额
+        user_data = await self.get_api_user_data(website_user_id)
+        current_total_display = (user_data.get("quota", 0) / ratio) if user_data else 0.0
 
-    # --- 原有方法保持兼容 ---
+        return "SUCCESS", {
+            "is_first": is_first,
+            "is_doubled": is_doubled,
+            "display_added": final_raw_quota / ratio,
+            "display_total": current_total_display,
+            "user_id": qq_id,
+            "site_id": website_user_id,
+        }
+
+    # --- 辅助绑定查询与方法 ---
     async def get_user_by_qq(self, qq_id: int) -> Optional[Dict]: 
         result = await self.execute_query("SELECT * FROM newapi_bindings WHERE qq_id = %s", (qq_id,), fetch='one')
         if result and result.get('binding_time') and isinstance(result['binding_time'], str):
@@ -303,39 +261,25 @@ class NewApiCore:
     async def adjust_balance_by_identifier(self, identifier: int, display_adjustment: float) -> Tuple[str, Optional[Dict]]:
         id_type, binding = await self.lookup_binding(identifier)
         if id_type == "NOT_FOUND": return "USER_NOT_FOUND", None
-        api_user_data = await self.get_api_user_data(binding['website_user_id'])
-        if not api_user_data: return "API_FETCH_FAILED", {"website_user_id": binding['website_user_id']}
+        website_user_id = binding['website_user_id']
         ratio = self.plugin.config.binding.quota_display_ratio
-        api_user_data["quota"] = max(0, api_user_data.get("quota", 0) + int(display_adjustment * ratio))
-        if not await self.update_api_user(api_user_data): return "API_UPDATE_FAILED", {"website_user_id": binding['website_user_id']}
-        return "SUCCESS", {"website_user_id": binding['website_user_id'], "new_display_quota": api_user_data["quota"] / ratio}
-
-    async def get_today_heist_counts_by_qq(self, robber_qq_id: int) -> int:
-        offset = self.plugin.config.check_in.timezone_offset_hours
-        query = f"SELECT COUNT(*) as count FROM daily_heist_log WHERE robber_qq_id = %s AND DATE(heist_time, '{offset:+} hours') = DATE('now', '{offset:+} hours')"
-        result = await self.execute_query(query, (robber_qq_id,), fetch='one')
-        return result['count'] if result else 0
-
-    async def get_today_defenses_count_by_id(self, victim_website_id: int) -> int:
-        offset = self.plugin.config.check_in.timezone_offset_hours
-        query = f"SELECT COUNT(*) as count FROM daily_heist_log WHERE victim_website_id = %s AND DATE(heist_time, '{offset:+} hours') = DATE('now', '{offset:+} hours') AND outcome IN ('SUCCESS', 'CRITICAL')"
-        result = await self.execute_query(query, (victim_website_id,), fetch='one')
-        return result['count'] if result else 0
-
-    async def get_last_heist_time_by_qq(self, robber_qq_id: int) -> Optional[datetime]:
-        query = "SELECT MAX(heist_time) as last_time FROM daily_heist_log WHERE robber_qq_id = %s"
-        result = await self.execute_query(query, (robber_qq_id,), fetch='one')
-        if result and result['last_time']:
-            try: return datetime.fromisoformat(result['last_time'].replace('Z', '+00:00'))
-            except: pass
-        return None
-
-    async def log_heist_attempt(self, robber_qq_id: int, victim_website_id: int, outcome: str, amount: int) -> int:
-        query = "INSERT INTO daily_heist_log (robber_qq_id, victim_website_id, heist_time, outcome, amount) VALUES (%s, %s, %s, %s, %s)"
-        return await self.execute_query(query, (robber_qq_id, victim_website_id, datetime.utcnow().isoformat(), outcome, amount))
-
-    async def transfer_display_quota(self, from_user_id: int, to_user_id: int, display_amount: float, allow_partial: bool = False) -> Tuple[bool, float, int]:
-        ratio = self.plugin.config.binding.quota_display_ratio
-        raw_amount = int(display_amount * ratio)
-        transfer_success, actual_raw_amount = await self._transfer_quota(from_user_id=from_user_id, to_user_id=to_user_id, raw_amount=raw_amount, allow_partial=allow_partial)
-        return transfer_success, actual_raw_amount / ratio, actual_raw_amount
+        raw_amount = int(display_adjustment * ratio)
+        if raw_amount <= 0:
+            return "API_UPDATE_FAILED", {"website_user_id": website_user_id}
+            
+        token = self.api_access_token
+        auth_header = token if token.startswith("Bearer ") else f"Bearer {token}"
+        admin_headers = {"Authorization": auth_header, "New-Api-User": str(self.api_admin_user_id)}
+        user_headers = {"Authorization": auth_header, "New-Api-User": str(website_user_id)}
+        
+        red_resp = await self.api_request("POST", "/api/redemption/", json_data={"name": f"admin_adjust_{website_user_id}", "quota": raw_amount, "count": 1}, custom_headers=admin_headers)
+        if not red_resp or not red_resp.get("success") or not red_resp.get("data"):
+            return "API_UPDATE_FAILED", {"website_user_id": website_user_id}
+        code = red_resp["data"][0]
+        topup_resp = await self.api_request("POST", "/api/user/topup", json_data={"key": code}, custom_headers=user_headers)
+        if not topup_resp or not topup_resp.get("success"):
+            return "API_UPDATE_FAILED", {"website_user_id": website_user_id}
+            
+        user_data = await self.get_api_user_data(website_user_id)
+        new_disp = (user_data.get("quota", 0) / ratio) if user_data else 0.0
+        return "SUCCESS", {"website_user_id": website_user_id, "new_display_quota": new_disp}
