@@ -114,9 +114,23 @@ class NewApiSuitePlugin(MaiBotPlugin):
         return True
 
     def _extract_user_id(self, message: Dict[str, Any]) -> Optional[int]:
-        user_info = message.get("user", {})
-        sender = message.get("sender", {})
-        uid = user_info.get("id") or sender.get("user_id") or message.get("user_id")
+        if not isinstance(message, dict):
+            return None
+        user_info = message.get("user", {}) or {}
+        sender = message.get("sender", {}) or {}
+        author = message.get("author", {}) or {}
+
+        uid = (
+            message.get("user_id")
+            or message.get("sender_id")
+            or message.get("author_id")
+            or user_info.get("id")
+            or user_info.get("user_id")
+            or sender.get("id")
+            or sender.get("user_id")
+            or author.get("id")
+            or author.get("user_id")
+        )
         try:
             return int(uid) if uid is not None else None
         except (ValueError, TypeError):
