@@ -311,7 +311,9 @@ class NewApiCore:
         admin_headers = {"Authorization": auth_header, "New-Api-User": str(self.api_admin_user_id)}
         user_headers = {"Authorization": auth_header, "New-Api-User": str(website_user_id)}
         
-        red_resp = await self.api_request("POST", "/api/redemption/", json_data={"name": f"admin_adjust_{website_user_id}", "quota": raw_amount, "count": 1}, custom_headers=admin_headers)
+        ts_suffix = str(int(datetime.utcnow().timestamp()))[-6:]
+        red_name = f"adj_{website_user_id}_{ts_suffix}"[:20]
+        red_resp = await self.api_request("POST", "/api/redemption/", json_data={"name": red_name, "quota": raw_amount, "count": 1}, custom_headers=admin_headers)
         if not red_resp or not red_resp.get("success") or not red_resp.get("data"):
             return "API_UPDATE_FAILED", {"website_user_id": website_user_id}
         code = red_resp["data"][0]
