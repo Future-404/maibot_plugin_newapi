@@ -116,25 +116,46 @@ class NewApiSuitePlugin(MaiBotPlugin):
     def _extract_user_id(self, message: Dict[str, Any]) -> Optional[int]:
         if not isinstance(message, dict):
             return None
+
+        candidates = []
+        # 1. 旧版 MaiBot 结构兼容
+        try:
+            candidates.append(message.get("user_info", {}).get("user_id"))
+        except AttributeError:
+            pass
+        try:
+            candidates.append(message.get("message_info", {}).get("user_info", {}).get("user_id"))
+        except AttributeError:
+            pass
+        try:
+            candidates.append(message.get("message_base_info", {}).get("user_id"))
+        except AttributeError:
+            pass
+
+        # 2. 新版 SDK 与 各平台（Discord/OneBot/QQ）网络结构
         user_info = message.get("user", {}) or {}
         sender = message.get("sender", {}) or {}
         author = message.get("author", {}) or {}
 
-        uid = (
-            message.get("user_id")
-            or message.get("sender_id")
-            or message.get("author_id")
-            or user_info.get("id")
-            or user_info.get("user_id")
-            or sender.get("id")
-            or sender.get("user_id")
-            or author.get("id")
-            or author.get("user_id")
-        )
-        try:
-            return int(uid) if uid is not None else None
-        except (ValueError, TypeError):
-            return None
+        candidates.extend([
+            message.get("user_id"),
+            message.get("sender_id"),
+            message.get("author_id"),
+            user_info.get("id"),
+            user_info.get("user_id"),
+            sender.get("id"),
+            sender.get("user_id"),
+            author.get("id"),
+            author.get("user_id"),
+        ])
+
+        for val in candidates:
+            if val is not None:
+                try:
+                    return int(val)
+                except (ValueError, TypeError):
+                    continue
+        return None
 
     def _extract_stream_id(self, kwargs: Dict[str, Any], message: Dict[str, Any]) -> str:
         if isinstance(kwargs, dict) and kwargs.get("stream_id"):
@@ -217,7 +238,7 @@ class NewApiSuitePlugin(MaiBotPlugin):
             return True, "", 0
         user_id = self._extract_user_id(message)
         if user_id is None:
-            text = "无法获取您的用户信息。"
+            text = "❌ 无法获取您的用户信息。"
             if stream_id:
                 await self.ctx.send.text(text, stream_id)
             return True, text, 2
@@ -248,7 +269,7 @@ class NewApiSuitePlugin(MaiBotPlugin):
             return True, "", 0
         user_id = self._extract_user_id(message)
         if user_id is None:
-            text = "无法获取您的用户信息。"
+            text = "❌ 无法获取您的用户信息。"
             if stream_id:
                 await self.ctx.send.text(text, stream_id)
             return True, text, 2
@@ -278,7 +299,7 @@ class NewApiSuitePlugin(MaiBotPlugin):
             return True, "", 0
         user_id = self._extract_user_id(message)
         if user_id is None:
-            text = "无法获取您的用户信息。"
+            text = "❌ 无法获取您的用户信息。"
             if stream_id:
                 await self.ctx.send.text(text, stream_id)
             return True, text, 2
