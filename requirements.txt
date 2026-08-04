@@ -1,2 +1,2 @@
-maibot-plugin-sdk>=2.0.0
-httpx>=0.24.0
+httpx
+python-dotenv

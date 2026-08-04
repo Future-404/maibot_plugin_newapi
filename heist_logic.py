@@ -1,11 +1,12 @@
 # heist_logic.py
 
 import random
-import logging
 from datetime import datetime
 from typing import Tuple, Dict, Any, Optional
 
-logger = logging.getLogger("newapi_heist")
+from src.common.logger import get_logger
+
+logger = get_logger("newapi_heist")
 
 class HeistLogic:
     """
@@ -39,8 +40,8 @@ class HeistLogic:
 
     async def _validate_heist_conditions(self, robber_qq_id: int, victim_identifier: int) -> Tuple[str, Dict[str, Any]]:
         """打劫行动的前置检查。"""
-        heist_conf = self.plugin.config.heist
-        if not heist_conf.enabled:
+        heist_conf = self.plugin.get_config('heist_settings', {})
+        if not heist_conf.get('enabled', False):
             return "DISABLED", {}
 
         robber_binding = await self.core.get_user_by_qq(robber_qq_id)
@@ -48,7 +49,7 @@ class HeistLogic:
             return "ROBBER_NOT_BOUND", {}
 
         # 新增：冷却时间检查
-        cooldown_seconds = heist_conf.cooldown_seconds
+        cooldown_seconds = heist_conf.get('cooldown_seconds', 3600)
         if cooldown_seconds > 0:
             last_heist_time = await self.core.get_last_heist_time_by_qq(robber_qq_id)
             if last_heist_time:
@@ -67,12 +68,12 @@ class HeistLogic:
         if robber_site_id == victim_site_id:
             return "CANNOT_ROB_SELF", {}
 
-        max_attempts = heist_conf.max_attempts_per_day
+        max_attempts = heist_conf.get('max_attempts_per_day', 1)
         robber_attempts = await self.core.get_today_heist_counts_by_qq(robber_qq_id)
         if robber_attempts >= max_attempts:
             return "ATTEMPTS_EXCEEDED", {}
 
-        max_defenses = heist_conf.max_defenses_per_day
+        max_defenses = heist_conf.get('max_defenses_per_day', 3)
         victim_defenses = await self.core.get_today_defenses_count_by_id(victim_site_id)
         if victim_defenses >= max_defenses:
             return "DEFENSES_EXCEEDED", {"victim_id": victim_site_id}
@@ -81,18 +82,18 @@ class HeistLogic:
 
     def _determine_heist_outcome(self, heist_conf: Dict[str, Any]) -> Tuple[str, float]:
         """判定打劫成败、是否暴击，并计算金额。"""
-        if random.random() < heist_conf.failure_chance:
-            penalty_display = heist_conf.failure_penalty
+        if random.random() < heist_conf.get('failure_chance', 0.5):
+            penalty_display = heist_conf.get('failure_penalty', 100.0)
             return "FAILURE", penalty_display
         else:
-            min_display = heist_conf.min_amount
-            max_display = heist_conf.max_amount
+            min_display = heist_conf.get('min_amount', 5.0)
+            max_display = heist_conf.get('max_amount', 40.0)
             # 确保min_display不大于max_display
             if min_display > max_display:
                 min_display, max_display = max_display, min_display
             base_display_gain = random.uniform(min_display, max_display)
             
-            is_critical = random.random() < heist_conf.critical_chance
+            is_critical = random.random() < heist_conf.get('critical_chance', 0.1)
             final_display_gain = base_display_gain * 2 if is_critical else base_display_gain
             
             outcome = "CRITICAL" if is_critical else "SUCCESS"

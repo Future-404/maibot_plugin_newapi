@@ -38,6 +38,3 @@ config.toml
 *.swp
 *.swo
 config.toml.backup.*
-
-# Claude Code local config
-.claude/

@@ -3,71 +3,48 @@ import asyncio
 import httpx
 import sqlite3
 import random
-import logging
 from datetime import datetime, timedelta
 from typing import Optional, Any, Dict, Tuple, List
+from dotenv import load_dotenv, find_dotenv
 
-logger = logging.getLogger("newapi_suite")
+from src.common.logger import get_logger
+
+logger = get_logger("newapi_suite")
 
 class NewApiCore:
     """
     NewAPI 核心工具类 (SQLite 高可靠原子化模式)。
     """
-    def __init__(self, plugin, data_dir: Optional[str] = None):
+    def __init__(self, plugin):
         self.plugin = plugin
-        if data_dir:
-            self.db_path = os.path.join(data_dir, "newapi_data.db")
-        else:
-            self.db_path = os.path.join(os.path.dirname(__file__), "newapi_data.db")
+        self.db_path = os.path.join(os.path.dirname(__file__), "newapi_data.db")
         self.api_base_url = None
         self.api_access_token = None
         self.api_admin_user_id = "1"
-        logger.info("[NewAPI Utils] 核心工具类已实例化，数据库路径: %s", self.db_path)
-
-    @staticmethod
-    def _load_env_file(path: str) -> Dict[str, str]:
-        """极简 .env 解析（避免引入第三方依赖）。"""
-        env: Dict[str, str] = {}
-        if not os.path.exists(path):
-            return env
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                env[key.strip()] = value.strip().strip('"').strip("'")
-        return env
+        logger.info(f"[NewAPI Utils] 核心工具类已实例化，数据库路径: {self.db_path}")
 
     async def initialize(self) -> bool:
-        """异步初始化：先建表，再检查 API 配置。"""
-        self.refresh_config()
-        # 数据库表始终初始化，不依赖 API 配置是否完整
+        """异步初始化，严格仅从插件目录加载 .env 配置。"""
+        plugin_env_path = os.path.join(os.path.dirname(__file__), ".env")
+        if os.path.exists(plugin_env_path):
+            load_dotenv(plugin_env_path, override=True)
+        
+        self.api_base_url = os.getenv("API_BASE_URL")
+        self.api_access_token = os.getenv("API_ACCESS_TOKEN")
+        self.api_admin_user_id = os.getenv("API_ADMIN_USER_ID", "1")
+
+        if not self.api_base_url or not self.api_access_token:
+            logger.error("[NewAPI Utils] API 配置不完整！初始化失败。")
+            return False
+
+        # 初始化数据库表并开启高性能模式
         try:
-            os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
             await asyncio.to_thread(self._ensure_tables_exist_sync)
             logger.info("✅ [NewAPI Utils] SQLite 数据库原子化配置已就绪 (WAL Mode Enabled)。")
+            return True
         except Exception as e:
-            logger.error("❌ [NewAPI Utils] 数据库初始化失败: %s", e, exc_info=True)
+            logger.error(f"❌ [NewAPI Utils] 数据库初始化失败: {e}", exc_info=True)
             return False
-        if not self.api_base_url or not self.api_access_token:
-            logger.warning("[NewAPI Utils] API 配置不完整，功能暂不可用。请在 WebUI 或 config.toml 中配置 api_base_url / api_access_token。")
-            return False
-        return True
-
-    def refresh_config(self) -> None:
-        """重新读取 API 连接配置（配置热重载时调用）。"""
-        config = self.plugin.config.api
-        self.api_base_url = config.api_base_url or ""
-        self.api_access_token = config.api_access_token or ""
-        self.api_admin_user_id = config.api_admin_user_id or "1"
-
-        # 兼容旧版：config 中未配置时，回退读取插件目录 .env
-        if not self.api_base_url or not self.api_access_token:
-            env = self._load_env_file(os.path.join(os.path.dirname(__file__), ".env"))
-            self.api_base_url = self.api_base_url or env.get("API_BASE_URL", "")
-            self.api_access_token = self.api_access_token or env.get("API_ACCESS_TOKEN", "")
-            self.api_admin_user_id = self.api_admin_user_id or env.get("API_ADMIN_USER_ID", "1")
 
     def _ensure_tables_exist_sync(self):
         """同步方法：开启 WAL 模式并确认表结构。"""
@@ -152,12 +129,12 @@ class NewApiCore:
 
     async def perform_check_in(self, qq_id: int, binding: Optional[Dict] = None) -> Tuple[str, Dict[str, Any]]:
         """执行签到 (原子化优化版本)。"""
-        check_in_conf = self.plugin.config.check_in
-        if not check_in_conf.enabled: return "DISABLED", {}
+        check_in_conf = self.plugin.get_config('check_in_settings', {})
+        if not check_in_conf.get('enabled', False): return "DISABLED", {}
         if not binding: binding = await self.get_user_by_qq(qq_id)
         if not binding: return "NOT_BOUND", {}
 
-        offset_hours = check_in_conf.timezone_offset_hours
+        offset_hours = check_in_conf.get('timezone_offset_hours', 8)
         time_delta = timedelta(hours=offset_hours)
         local_today = (datetime.utcnow() + time_delta).date()
         
@@ -171,15 +148,10 @@ class NewApiCore:
                 return "ALREADY_CHECKED_IN", {}
 
         # 2. 计算奖励
-        ratio = self.plugin.config.binding.quota_display_ratio
-        is_doubled = random.random() < check_in_conf.double_chance
-        base_display_quota = random.uniform(check_in_conf.min_display_quota, check_in_conf.max_display_quota)
-        is_first = last_check_in_time is None
-        bonus_quota = (
-            int(check_in_conf.first_check_in_bonus_display_quota * ratio)
-            if is_first and check_in_conf.first_check_in_bonus_enabled
-            else 0
-        )
+        ratio = self.plugin.get_config('binding_settings.quota_display_ratio', 500000)
+        is_doubled = random.random() < check_in_conf.get('double_chance', 0.1)
+        base_display_quota = random.uniform(check_in_conf.get('min_display_quota', 0), check_in_conf.get('max_display_quota', 0))
+        bonus_quota = int(check_in_conf.get('first_check_in_bonus_display_quota', 0) * ratio) if last_check_in_time is None else 0
         final_quota = int(base_display_quota * ratio) * (2 if is_doubled else 1) + bonus_quota
 
         # 3. 【核心变更】先写本地数据库锁定状态
@@ -281,7 +253,8 @@ class NewApiCore:
     async def revert_user_group(self, website_user_id: int) -> bool:
         api_user_data = await self.get_api_user_data(website_user_id)
         if not api_user_data: return False
-        revert_group = self.plugin.config.binding.binding_group
+        leave_conf = self.plugin.get_config('group_leave_settings', {})
+        revert_group = leave_conf.get('revert_group_on_leave', 'default')
         if api_user_data.get('group') != revert_group:
             api_user_data['group'] = revert_group
             return await self.update_api_user(api_user_data)
@@ -305,19 +278,19 @@ class NewApiCore:
         if id_type == "NOT_FOUND": return "USER_NOT_FOUND", None
         api_user_data = await self.get_api_user_data(binding['website_user_id'])
         if not api_user_data: return "API_FETCH_FAILED", {"website_user_id": binding['website_user_id']}
-        ratio = self.plugin.config.binding.quota_display_ratio
+        ratio = self.plugin.get_config('binding_settings.quota_display_ratio', 500000)
         api_user_data["quota"] = max(0, api_user_data.get("quota", 0) + int(display_adjustment * ratio))
         if not await self.update_api_user(api_user_data): return "API_UPDATE_FAILED", {"website_user_id": binding['website_user_id']}
         return "SUCCESS", {"website_user_id": binding['website_user_id'], "new_display_quota": api_user_data["quota"] / ratio}
 
     async def get_today_heist_counts_by_qq(self, robber_qq_id: int) -> int:
-        offset = self.plugin.config.check_in.timezone_offset_hours
+        offset = self.plugin.get_config('check_in_settings.timezone_offset_hours', 8)
         query = f"SELECT COUNT(*) as count FROM daily_heist_log WHERE robber_qq_id = %s AND DATE(heist_time, '{offset:+} hours') = DATE('now', '{offset:+} hours')"
         result = await self.execute_query(query, (robber_qq_id,), fetch='one')
         return result['count'] if result else 0
 
     async def get_today_defenses_count_by_id(self, victim_website_id: int) -> int:
-        offset = self.plugin.config.check_in.timezone_offset_hours
+        offset = self.plugin.get_config('check_in_settings.timezone_offset_hours', 8)
         query = f"SELECT COUNT(*) as count FROM daily_heist_log WHERE victim_website_id = %s AND DATE(heist_time, '{offset:+} hours') = DATE('now', '{offset:+} hours') AND outcome IN ('SUCCESS', 'CRITICAL')"
         result = await self.execute_query(query, (victim_website_id,), fetch='one')
         return result['count'] if result else 0
@@ -335,7 +308,7 @@ class NewApiCore:
         return await self.execute_query(query, (robber_qq_id, victim_website_id, datetime.utcnow().isoformat(), outcome, amount))
 
     async def transfer_display_quota(self, from_user_id: int, to_user_id: int, display_amount: float, allow_partial: bool = False) -> Tuple[bool, float, int]:
-        ratio = self.plugin.config.binding.quota_display_ratio
+        ratio = self.plugin.get_config('binding_settings.quota_display_ratio', 500000)
         raw_amount = int(display_amount * ratio)
         transfer_success, actual_raw_amount = await self._transfer_quota(from_user_id=from_user_id, to_user_id=to_user_id, raw_amount=raw_amount, allow_partial=allow_partial)
         return transfer_success, actual_raw_amount / ratio, actual_raw_amount
