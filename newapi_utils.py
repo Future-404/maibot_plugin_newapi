@@ -192,8 +192,10 @@ class NewApiCore:
             "Authorization": auth_header,
             "New-Api-User": str(self.api_admin_user_id)
         }
+        ts_suffix = str(int(datetime.utcnow().timestamp()))[-6:]
+        redemption_name = f"c_{website_user_id}_{ts_suffix}"[:20]
         redemption_payload = {
-            "name": f"checkin_{website_user_id}_{int(datetime.utcnow().timestamp())}",
+            "name": redemption_name,
             "quota": final_raw_quota,
             "count": 1
         }
