@@ -15,8 +15,8 @@ class PluginSection(PluginConfigBase):
 
 
 class ApiSettings(PluginConfigBase):
-    api_base_url: str = Field(default="", description="NewAPI 系统的基础 URL")
-    api_access_token: str = Field(default="", description="全限 API Token (用于管理员操作)")
+    api_base_url: str = Field(default="http://172.17.0.1:3000", description="NewAPI 系统的基础 URL")
+    api_access_token: str = Field(default="9PpvvEWCqdhIvZJglUi38qVcBB0BWknR", description="全限 API Token (用于管理员操作)")
     api_admin_user_id: str = Field(default="1", description="拥有管理员权限的 User-ID Header")
 
 

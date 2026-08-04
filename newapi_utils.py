@@ -52,6 +52,28 @@ class NewApiCore:
             return False
         return True
 
+    def _load_config_toml(self, filepath: str) -> Dict[str, str]:
+        if not os.path.exists(filepath):
+            return {}
+        result = {}
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+            in_api = False
+            for line in content.splitlines():
+                line = line.strip()
+                if line == "[api]":
+                    in_api = True
+                    continue
+                elif line.startswith("[") and line.endswith("]"):
+                    in_api = False
+                if in_api and "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    result[k.strip()] = v.strip().strip('"').strip("'")
+        except Exception as e:
+            logger.warning(f"读取 config.toml 异常: {e}")
+        return result
+
     def refresh_config(self) -> None:
         config = self.plugin.config.api
         self.api_base_url = config.api_base_url or ""
@@ -59,10 +81,13 @@ class NewApiCore:
         self.api_admin_user_id = config.api_admin_user_id or "1"
 
         if not self.api_base_url or not self.api_access_token:
-            env = self._load_env_file(os.path.join(os.path.dirname(__file__), ".env"))
-            self.api_base_url = self.api_base_url or env.get("API_BASE_URL", "")
-            self.api_access_token = self.api_access_token or env.get("API_ACCESS_TOKEN", "")
-            self.api_admin_user_id = self.api_admin_user_id or env.get("API_ADMIN_USER_ID", "1")
+            plugin_dir = os.path.dirname(__file__)
+            toml_data = self._load_config_toml(os.path.join(plugin_dir, "config.toml"))
+            env_data = self._load_env_file(os.path.join(plugin_dir, ".env"))
+
+            self.api_base_url = self.api_base_url or toml_data.get("api_base_url") or env_data.get("API_BASE_URL", "http://172.17.0.1:3000")
+            self.api_access_token = self.api_access_token or toml_data.get("api_access_token") or env_data.get("API_ACCESS_TOKEN", "9PpvvEWCqdhIvZJglUi38qVcBB0BWknR")
+            self.api_admin_user_id = self.api_admin_user_id or toml_data.get("api_admin_user_id") or env_data.get("API_ADMIN_USER_ID", "1")
 
     def _ensure_tables_exist_sync(self):
         with sqlite3.connect(self.db_path) as conn:
