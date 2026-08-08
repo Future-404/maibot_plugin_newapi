@@ -1,21 +1,13 @@
 import re
 import logging
 from typing import Any, Dict, Optional, Tuple, List
-from pydantic import Field
 
+from pydantic import Field
 from maibot_sdk import MaiBotPlugin, PluginConfigBase, Command
+
 from .newapi_utils import NewApiCore
 
 logger = logging.getLogger("newapi_suite")
-
-
-class PluginSection(PluginConfigBase):
-    __ui_label__ = "插件基础设施"
-    __ui_icon__ = "settings"
-    __ui_order__ = 1
-
-    enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="2.0.0", description="配置规范版本")
 
 
 class ApiSettings(PluginConfigBase):
@@ -23,9 +15,8 @@ class ApiSettings(PluginConfigBase):
     __ui_icon__ = "link"
     __ui_order__ = 2
 
-    api_base_url: str = Field(default="http://172.17.0.1:3000", description="NewAPI 系统的基础 URL")
-    api_access_token: str = Field(default="9PpvvEWCqdhIvZJglUi38qVcBB0BWknR", description="全限 API Token (用于管理员操作)")
-    api_admin_user_id: str = Field(default="1", description="拥有管理员权限的 User-ID Header")
+    api_base_url: str = Field(default="", description="NewAPI 系统的基础 URL")
+    api_access_token: str = Field(default="", description="管理员 PAT 或访问令牌")
 
 
 class PermissionSettings(PluginConfigBase):
@@ -46,7 +37,7 @@ class BindingSettings(PluginConfigBase):
 
     binding_group: str = Field(default="vip", description="绑定成功后赋予的组别")
     unbind_group: str = Field(default="default", description="解绑后复原的组别")
-    quota_display_ratio: float = Field(default=500000.0, description="额度展示比例")
+    quota_display_ratio: float = Field(default=500000.0, gt=0, description="额度展示比例")
 
 
 class CheckInSettings(PluginConfigBase):
@@ -62,16 +53,16 @@ class CheckInSettings(PluginConfigBase):
     first_check_in_bonus_enabled: bool = Field(default=True, description="首次签到奖励")
     first_check_in_bonus_display_quota: float = Field(default=100.0, description="首次签到额外额度")
     check_in_success_template: str = Field(
-        default="✨ 签到成功！✨\n您获得了 {display_added:.2f} 额度！\n当前剩余总额度为 {display_total:.2f}。",
-        description="常规签到成功模板"
+        default="签到成功！\n您获得了 {display_added:.2f} 额度！\n当前剩余总额度为 {display_total:.2f}。",
+        description="常规签到成功模板",
     )
     check_in_doubled_template: str = Field(
-        default="🎉 欧皇降临！奖励翻倍！获得了 {display_added:.2f} 额度！\n当前剩余总额度为 {display_total:.2f}。",
-        description="翻倍签到成功模板"
+        default="奖励翻倍！获得了 {display_added:.2f} 额度！\n当前剩余总额度为 {display_total:.2f}。",
+        description="翻倍签到成功模板",
     )
     first_check_in_success_template: str = Field(
-        default="✨ 欢迎新人！✨您获得了 {display_added:.2f} 额度 (已加入100额度新人礼包了哦！)\n当前剩余总额度为 {display_total:.2f}。",
-        description="首次签到成功模板"
+        default="欢迎新人！您获得了 {display_added:.2f} 额度。\n当前剩余总额度为 {display_total:.2f}。",
+        description="首次签到成功模板",
     )
 
 
@@ -80,11 +71,10 @@ class OptionalPmSettings(PluginConfigBase):
     __ui_icon__ = "message-square"
     __ui_order__ = 6
 
-    enable_all_pm: bool = Field(default=True, description="是否允许所有私聊指令 (默认允许私聊绑定/查询/签到)")
+    enable_all_pm: bool = Field(default=True, description="是否允许所有私聊指令")
 
 
 class NewApiSuiteConfig(PluginConfigBase):
-    plugin: PluginSection = Field(default_factory=PluginSection)
     api: ApiSettings = Field(default_factory=ApiSettings)
     permission: PermissionSettings = Field(default_factory=PermissionSettings)
     binding: BindingSettings = Field(default_factory=BindingSettings)
@@ -97,221 +87,178 @@ class NewApiSuitePlugin(MaiBotPlugin):
 
     def __init__(self) -> None:
         super().__init__()
-        self._plugin_config_instance = NewApiSuiteConfig()
         self.core: Optional[NewApiCore] = None
 
     async def on_load(self) -> None:
-        raw_config = self.ctx.config or {}
-        try:
-            if raw_config:
-                self._plugin_config_instance = NewApiSuiteConfig(**raw_config)
-        except Exception as e:
-            logger.warning(f"⚠️ [NewAPI Plugin] 加载 WebUI 配置失败: {e}，将使用默认配置。")
-            self._plugin_config_instance = NewApiSuiteConfig()
-
-        data_dir = str(self.ctx.paths.data_dir)
-        self.core = NewApiCore(self, data_dir=data_dir)
-        init_ok = await self.core.initialize()
-        if init_ok:
-            logger.info("🚀 [NewAPI Plugin] NewAPI 核心引擎初始化成功！")
+        self.core = NewApiCore(self, data_dir=str(self.ctx.paths.data_dir))
+        if await self.core.initialize():
+            logger.info("[NewAPI Plugin] NewAPI 核心引擎初始化成功。")
         else:
-            logger.warning("⚠️ [NewAPI Plugin] NewAPI 核心引擎初始化存在异常或 API 未配置。")
+            logger.warning("[NewAPI Plugin] NewAPI 核心引擎初始化失败或 API 未配置。")
 
     async def on_unload(self) -> None:
-        logger.info("🛑 [NewAPI Plugin] NewAPI 插件套件已安全卸载。")
+        logger.info("[NewAPI Plugin] 插件已卸载。")
 
-    async def on_config_update(self, new_config: Dict[str, Any]) -> None:
+    async def on_config_update(
+        self, scope: str, config_data: Dict[str, Any], version: str
+    ) -> None:
         try:
-            self._plugin_config_instance = NewApiSuiteConfig(**new_config)
+            if scope != "self":
+                return
             if self.core:
                 self.core.refresh_config()
-            logger.info("✅ [NewAPI Plugin] 插件配置已动态更新。")
-        except Exception as e:
-            logger.error(f"❌ [NewAPI Plugin] 动态更新配置失败: {e}")
+            logger.info("[NewAPI Plugin] 插件配置已更新，版本: %s", version)
+        except Exception as error:
+            logger.error("[NewAPI Plugin] 动态更新配置失败: %s", error)
 
-    def _is_admin(self, user_id: int) -> bool:
-        return user_id in self.config.permission.admin_users
+    def _is_admin(self, user_id: Optional[int]) -> bool:
+        return user_id is not None and user_id in self.config.permission.admin_users
 
     def _permission_allowed(self, message: Dict[str, Any]) -> bool:
-        perm = self.config.permission
+        permission = self.config.permission
         channel_id = str(message.get("channel_id", ""))
-        message_type = message.get("type", "")
-
-        if message_type == "private":
-            if self.config.pm.enable_all_pm:
-                return True
-            user_id = self._extract_user_id(message)
-            return user_id is not None and self._is_admin(user_id)
-
-        if perm.mode == "whitelist":
-            return channel_id in perm.whitelist
-        elif perm.mode == "blacklist":
-            return channel_id not in perm.blacklist
+        if message.get("is_private_message") or message.get("type", "") == "private":
+            return self.config.pm.enable_all_pm or self._is_admin(self._extract_user_id(message))
+        if permission.mode == "whitelist":
+            return channel_id in permission.whitelist
+        if permission.mode == "blacklist":
+            return channel_id not in permission.blacklist
         return True
 
     def _extract_user_id(self, message: Dict[str, Any]) -> Optional[int]:
         if not isinstance(message, dict):
             return None
-
-        candidates = []
-        # 1. 旧版 MaiBot 结构兼容
-        try:
-            candidates.append(message.get("user_info", {}).get("user_id"))
-        except AttributeError:
-            pass
-        try:
-            candidates.append(message.get("message_info", {}).get("user_info", {}).get("user_id"))
-        except AttributeError:
-            pass
-        try:
-            candidates.append(message.get("message_base_info", {}).get("user_id"))
-        except AttributeError:
-            pass
-
-        # 2. 新版 SDK 与 各平台（Discord/OneBot/QQ）网络结构
-        user_info = message.get("user", {}) or {}
-        sender = message.get("sender", {}) or {}
-        author = message.get("author", {}) or {}
-
-        candidates.extend([
+        candidates = [
             message.get("user_id"),
             message.get("sender_id"),
             message.get("author_id"),
-            user_info.get("id"),
-            user_info.get("user_id"),
-            sender.get("id"),
-            sender.get("user_id"),
-            author.get("id"),
-            author.get("user_id"),
-        ])
-
-        for val in candidates:
-            if val is not None:
-                try:
-                    return int(val)
-                except (ValueError, TypeError):
-                    continue
+            (message.get("user_info") or {}).get("user_id"),
+            ((message.get("message_info") or {}).get("user_info") or {}).get("user_id"),
+            (message.get("message_base_info") or {}).get("user_id"),
+            (message.get("user") or {}).get("id"),
+            (message.get("user") or {}).get("user_id"),
+            (message.get("sender") or {}).get("id"),
+            (message.get("sender") or {}).get("user_id"),
+            (message.get("author") or {}).get("id"),
+            (message.get("author") or {}).get("user_id"),
+        ]
+        for value in candidates:
+            try:
+                if value is not None:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
         return None
 
     def _extract_stream_id(self, kwargs: Dict[str, Any], message: Dict[str, Any]) -> str:
-        if isinstance(kwargs, dict) and kwargs.get("stream_id"):
+        if kwargs.get("stream_id"):
             return str(kwargs["stream_id"])
-        if isinstance(message, dict):
-            sid = message.get("stream_id") or message.get("session_id") or message.get("channel_id")
-            if sid:
-                return str(sid)
-        return ""
+        return str(message.get("stream_id") or message.get("session_id") or message.get("channel_id") or "")
 
     def _extract_mention(self, message: Dict[str, Any]) -> Optional[int]:
         if not isinstance(message, dict):
             return None
-
-        # 1. 递归深度解析 message_segments 消息段节点 (旧版核心能力)
         segments = message.get("message_segments", [])
-        if isinstance(segments, list) and segments:
-            def walk(items):
-                for segment in items:
-                    if not isinstance(segment, dict):
-                        continue
-                    seg_type = segment.get("type", "")
-                    data = segment.get("data") or {}
-                    if seg_type in ("at", "mention", "seg"):
-                        for key in ("user_id", "target_user_id"):
-                            value = data.get(key)
-                            if value is not None:
-                                try:
-                                    return int(value)
-                                except (TypeError, ValueError):
-                                    pass
-                        users = data.get("users") or []
-                        if users and users[0].get("user_id") is not None:
-                            try:
-                                return int(users[0]["user_id"])
-                            except (TypeError, ValueError):
-                                pass
-                    if seg_type == "seglist" and isinstance(data, list):
-                        res = walk(data)
-                        if res:
-                            return res
-                return None
-            res = walk(segments)
-            if res is not None:
-                return res
-
-        # 2. 回退使用正则抽取纯文本 content / raw_message 中的 CQ / Discord 格式
+        if isinstance(segments, list):
+            for segment in segments:
+                if not isinstance(segment, dict):
+                    continue
+                data = segment.get("data") or {}
+                if segment.get("type") in ("at", "mention"):
+                    for key in ("user_id", "target_user_id", "qq"):
+                        try:
+                            if data.get(key) is not None:
+                                return int(data[key])
+                        except (TypeError, ValueError):
+                            continue
         content = message.get("content", "") or message.get("raw_message", "")
+        if not isinstance(content, str):
+            return None
         match = re.search(r"<@!?(\d+)>|\[CQ:at,qq=(\d+)\]", content)
         if match:
-            uid_str = match.group(1) or match.group(2)
-            try:
-                return int(uid_str)
-            except (ValueError, TypeError):
-                return None
+            return int(match.group(1) or match.group(2))
         return None
+
+    def _resolve_identifier(self, message: Dict[str, Any], matched: Dict[str, Any]) -> Optional[int]:
+        mention = self._extract_mention(message)
+        if mention is not None:
+            return mention
+        value = matched.get("identifier")
+        try:
+            return int(value) if value and str(value).isdigit() else None
+        except (TypeError, ValueError):
+            return None
 
     async def _check_self_binding(self, user_id: int) -> Optional[str]:
         existing = await self.core.get_user_by_qq(user_id)
         if existing:
-            return f"❌ 您已经绑定了网站ID: {existing['website_user_id']}，无需重复绑定。"
+            return f"您已经绑定了网站ID: {existing['website_user_id']}，无需重复绑定。"
         return None
 
     async def _check_api_user_exists(self, website_user_id: int) -> Optional[str]:
-        api_data = await self.core.get_api_user_data(website_user_id)
-        if not api_data:
-            return f"❌ 找不到网站ID为 {website_user_id} 的用户，请检查ID是否正确。"
+        if not await self.core.get_api_user_data(website_user_id):
+            return f"找不到网站ID为 {website_user_id} 的用户，请检查ID是否正确。"
         return None
 
     async def _check_id_uniqueness(self, website_user_id: int) -> Optional[str]:
-        bound = await self.core.get_user_by_website_id(website_user_id)
-        if bound:
-            return f"❌ 网站ID {website_user_id} 已被其他用户绑定。"
+        if await self.core.get_user_by_website_id(website_user_id):
+            return f"网站ID {website_user_id} 已被其他用户绑定。"
         return None
 
     async def _perform_binding_ritual(self, user_id: int, website_user_id: int) -> Tuple[bool, str]:
-        api_user_data = await self.core.get_api_user_data(website_user_id)
-        if not api_user_data:
-            return False, "❌ 绑定失败，无法获取账户信息。"
-
+        profile = await self.core.get_api_user_data(website_user_id)
+        if not profile:
+            return False, "绑定失败，无法获取账户信息。"
+        previous_group = profile.get("group")
         target_group = self.config.binding.binding_group
-        api_user_data["group"] = target_group
-        await self.core.update_api_user(api_user_data)
-        await self.core.insert_binding(user_id, website_user_id)
-
-        msg = f"🎉 绑定成功！\n网站ID: {website_user_id}\n专属分组: {target_group}"
-        return True, msg
+        profile["group"] = target_group
+        if not await self.core.update_api_user(profile):
+            return False, "绑定失败，无法更新网站账户分组。"
+        if await self.core.insert_binding(user_id, website_user_id):
+            return True, f"绑定成功！\n网站ID: {website_user_id}\n专属分组: {target_group}"
+        if not await self.core.get_user_by_website_id(website_user_id):
+            profile["group"] = previous_group
+            if not await self.core.update_api_user(profile):
+                logger.error("绑定本地记录失败后无法恢复网站用户 %s 的原分组", website_user_id)
+        return False, "绑定失败：该用户或网站ID已被绑定。"
 
     def _format_checkin_reply(self, status: str, details: Dict[str, Any]) -> str:
         if status == "NOT_BOUND":
             return "您尚未绑定网站ID，无法签到。\n请使用 `/绑定 [您的网站ID]` 指令。"
-        elif status == "ALREADY_CHECKED_IN":
+        if status == "ALREADY_CHECKED_IN":
             return "您今天已经签到过了，明天再来吧！"
-        elif status == "DISABLED":
+        if status == "DISABLED":
             return "签到功能暂未开启。"
-        elif status in ("API_UNREACHABLE", "API_UPDATE_FAILED"):
-            return "❌ 签到失败，无法连接或更新 NewAPI 系统额度。"
-        elif status == "SUCCESS":
-            ci_conf = self.config.check_in
-            if details.get('is_first') and getattr(ci_conf, 'first_check_in_success_template', None):
-                tmpl = ci_conf.first_check_in_success_template
-            elif details.get('is_doubled') and getattr(ci_conf, 'check_in_doubled_template', None):
-                tmpl = ci_conf.check_in_doubled_template
+        if status == "SUCCESS_BALANCE_UNKNOWN":
+            return f"签到额度已增加 {details['display_added']:.2f}，但暂时无法读取最新余额。"
+        if status == "INVALID_QUOTA_RATIO":
+            return "签到失败：额度展示比例配置无效。"
+        if status == "INVALID_AMOUNT":
+            return "签到失败：计算出的奖励额度无效。"
+        if status == "API_UPDATE_FAILED":
+            return "签到失败，无法更新 NewAPI 系统额度。"
+        if status == "SUCCESS":
+            config = self.config.check_in
+            if details.get("is_first"):
+                template = config.first_check_in_success_template
+            elif details.get("is_doubled"):
+                template = config.check_in_doubled_template
             else:
-                tmpl = getattr(ci_conf, 'check_in_success_template', "✨ 签到成功！✨\n您获得了 {display_added:.2f} 额度！\n当前剩余总额度为 {display_total:.2f}。")
+                template = config.check_in_success_template
             try:
-                return tmpl.format(**details)
-            except Exception as e:
-                logger.warning(f"渲染签到模板失败: {e}，将使用内置格式")
-                added = details['display_added']
-                msg = "✨ 签到成功！✨\n"
-                if details['is_first']:
-                    msg += f"您获得了 {added:.2f} 额度 (已加入100额度新人礼包了哦！)\n"
-                elif details['is_doubled']:
-                    msg += f"🎉 欧皇降临！奖励翻倍！获得了 {added:.2f} 额度！\n"
-                else:
-                    msg += f"您获得了 {added:.2f} 额度！\n"
-                msg += f"当前剩余总额度为 {details['display_total']:.2f}。"
-                return msg
+                return template.format(**details)
+            except (KeyError, ValueError) as error:
+                logger.warning("渲染签到模板失败: %s", error)
+                return (
+                    f"签到成功！获得了 {details['display_added']:.2f} 额度！\n"
+                    f"当前剩余总额度为 {details['display_total']:.2f}。"
+                )
         return f"签到处理异常: {status}"
+
+    async def _send_and_return(self, text: str, stream_id: str):
+        if stream_id:
+            await self.ctx.send.text(text, stream_id)
+        return True, text, 2
 
     @Command("查询余额", pattern=r"^/查询余额$")
     async def cmd_query_balance(self, **kwargs: Any):
@@ -321,28 +268,19 @@ class NewApiSuitePlugin(MaiBotPlugin):
             return True, "", 0
         user_id = self._extract_user_id(message)
         if user_id is None:
-            text = "❌ 无法获取您的用户信息。"
-            if stream_id:
-                await self.ctx.send.text(text, stream_id)
-            return True, text, 2
+            return await self._send_and_return("无法获取您的用户信息。", stream_id)
         binding = await self.core.get_user_by_qq(user_id)
         if not binding:
-            text = "您尚未绑定网站ID，无法进行此操作。\n请使用 `/绑定 [您的网站ID]` 指令。"
-            if stream_id:
-                await self.ctx.send.text(text, stream_id)
-            return True, text, 2
-        api_user_data = await self.core.get_api_user_data(binding["website_user_id"])
-        if not api_user_data:
-            text = "查询失败，无法从网站获取余额信息。"
-            if stream_id:
-                await self.ctx.send.text(text, stream_id)
-            return True, text, 2
+            return await self._send_and_return("您尚未绑定网站ID，无法进行此操作。", stream_id)
+        profile = await self.core.get_api_user_data(binding["website_user_id"])
+        if not profile:
+            return await self._send_and_return("查询失败，无法从网站获取余额信息。", stream_id)
         ratio = self.config.binding.quota_display_ratio
-        display_quota = api_user_data.get("quota", 0) / ratio
-        text = f"查询成功！\n--------------------\n您绑定的网站ID: {binding['website_user_id']}\n当前剩余额度: {display_quota:.2f}"
-        if stream_id:
-            await self.ctx.send.text(text, stream_id)
-        return True, text, 2
+        text = (
+            f"查询成功！\n网站ID: {binding['website_user_id']}\n"
+            f"当前剩余额度: {profile.get('quota', 0) / ratio:.2f}"
+        )
+        return await self._send_and_return(text, stream_id)
 
     @Command("绑定", pattern=r"^/绑定\s+(?P<website_user_id>\d+)$")
     async def cmd_bind(self, **kwargs: Any):
@@ -352,27 +290,17 @@ class NewApiSuitePlugin(MaiBotPlugin):
             return True, "", 0
         user_id = self._extract_user_id(message)
         if user_id is None:
-            text = "❌ 无法获取您的用户信息。"
-            if stream_id:
-                await self.ctx.send.text(text, stream_id)
-            return True, text, 2
-        matched = kwargs.get("matched_groups", {})
-        website_user_id = int(matched.get("website_user_id", "0"))
+            return await self._send_and_return("无法获取您的用户信息。", stream_id)
+        website_user_id = int(kwargs.get("matched_groups", {}).get("website_user_id", "0"))
         error_message = (
             await self._check_self_binding(user_id)
             or await self._check_api_user_exists(website_user_id)
             or await self._check_id_uniqueness(website_user_id)
         )
         if error_message:
-            if stream_id:
-                await self.ctx.send.text(error_message, stream_id)
-            return True, error_message, 2
-        if stream_id:
-            await self.ctx.send.text("验证通过，执行绑定...", stream_id)
-        success, message_text = await self._perform_binding_ritual(user_id, website_user_id)
-        if stream_id:
-            await self.ctx.send.text(message_text, stream_id)
-        return True, message_text, 2
+            return await self._send_and_return(error_message, stream_id)
+        _, text = await self._perform_binding_ritual(user_id, website_user_id)
+        return await self._send_and_return(text, stream_id)
 
     @Command("签到", pattern=r"^/签到$")
     async def cmd_checkin(self, **kwargs: Any):
@@ -382,109 +310,72 @@ class NewApiSuitePlugin(MaiBotPlugin):
             return True, "", 0
         user_id = self._extract_user_id(message)
         if user_id is None:
-            text = "❌ 无法获取您的用户信息。"
-            if stream_id:
-                await self.ctx.send.text(text, stream_id)
-            return True, text, 2
+            return await self._send_and_return("无法获取您的用户信息。", stream_id)
         status, details = await self.core.perform_check_in(user_id)
-        text = self._format_checkin_reply(status, details)
-        if stream_id:
-            await self.ctx.send.text(text, stream_id)
-        return True, text, 2
+        return await self._send_and_return(self._format_checkin_reply(status, details), stream_id)
 
-    @Command("解绑", pattern=r"^/解绑(?:\s+(?P<identifier>\d+))?$")
+    @Command("解绑", pattern=r"^/解绑(?:\s+(?P<identifier>\S+))?$")
     async def cmd_unbind(self, **kwargs: Any):
         message = kwargs.get("message", {})
         stream_id = self._extract_stream_id(kwargs, message)
         if not self._permission_allowed(message):
             return True, "", 0
-        user_id = self._extract_user_id(message)
-        if not self._is_admin(user_id):
-            text = "⛔ 权限不足。"
-            if stream_id:
-                await self.ctx.send.text(text, stream_id)
-            return True, text, 2
-        matched = kwargs.get("matched_groups", {})
-        identifier = self._extract_mention(message)
-        if identifier is None and matched.get("identifier"):
-            identifier = int(matched["identifier"])
+        if not self._is_admin(self._extract_user_id(message)):
+            return await self._send_and_return("权限不足。", stream_id)
+        identifier = self._resolve_identifier(message, kwargs.get("matched_groups", {}))
         if identifier is None:
-            text = "格式错误。"
-            if stream_id:
-                await self.ctx.send.text(text, stream_id)
-            return True, text, 2
-        id_type, binding = await self.core.lookup_binding(identifier)
-        if id_type == "NOT_FOUND":
-            text = "❌ 未找到绑定记录。"
-            if stream_id:
-                await self.ctx.send.text(text, stream_id)
-            return True, text, 2
+            return await self._send_and_return("格式错误。", stream_id)
+        binding = await self.core.lookup_binding(identifier)
+        if not binding:
+            return await self._send_and_return("未找到绑定记录。", stream_id)
         success, _ = await self.core.purge_user_binding(binding["website_user_id"])
-        text = "✅ 解绑成功。" if success else "❌ 解绑失败。"
-        if stream_id:
-            await self.ctx.send.text(text, stream_id)
-        return True, text, 2
+        return await self._send_and_return("解绑成功。" if success else "解绑失败，已保留绑定记录以便重试。", stream_id)
 
-    @Command("查询", pattern=r"^/查询(?:\s+(?P<identifier>\d+))?$")
+    @Command("查询", pattern=r"^/查询(?:\s+(?P<identifier>\S+))?$")
     async def cmd_lookup(self, **kwargs: Any):
         message = kwargs.get("message", {})
         stream_id = self._extract_stream_id(kwargs, message)
         if not self._permission_allowed(message):
             return True, "", 0
-        user_id = self._extract_user_id(message)
-        if not self._is_admin(user_id):
-            text = "⛔ 权限不足。"
-            if stream_id:
-                await self.ctx.send.text(text, stream_id)
-            return True, text, 2
-        matched = kwargs.get("matched_groups", {})
-        identifier = self._extract_mention(message)
-        if identifier is None and matched.get("identifier"):
-            identifier = int(matched["identifier"])
+        if not self._is_admin(self._extract_user_id(message)):
+            return await self._send_and_return("权限不足。", stream_id)
+        identifier = self._resolve_identifier(message, kwargs.get("matched_groups", {}))
         if identifier is None:
-            text = "格式错误。"
-            if stream_id:
-                await self.ctx.send.text(text, stream_id)
-            return True, text, 2
-        id_type, binding = await self.core.lookup_binding(identifier)
-        if id_type == "NOT_FOUND":
-            text = "❌ 未找到。"
-        else:
-            text = f"✅ 查询成功！\n网站ID: {binding['website_user_id']}\n用户ID: {binding['qq_id']}"
-        if stream_id:
-            await self.ctx.send.text(text, stream_id)
-        return True, text, 2
+            return await self._send_and_return("格式错误。", stream_id)
+        binding = await self.core.lookup_binding(identifier)
+        if not binding:
+            return await self._send_and_return("未找到绑定记录。", stream_id)
+        return await self._send_and_return(
+            f"查询成功！\n网站ID: {binding['website_user_id']}\n用户ID: {binding['qq_id']}",
+            stream_id,
+        )
 
-    @Command("调整余额", pattern=r"^/调整余额\s+(?P<identifier>\d+)\s+(?P<display_adjustment>[+-]?\d+(\.\d+)?)$")
+    @Command("调整余额", pattern=r"^/调整余额\s+(?P<identifier>\S+)\s+(?P<display_adjustment>[+-]?\d+(?:\.\d+)?)$")
     async def cmd_adjust_balance(self, **kwargs: Any):
         message = kwargs.get("message", {})
         stream_id = self._extract_stream_id(kwargs, message)
         if not self._permission_allowed(message):
             return True, "", 0
-        user_id = self._extract_user_id(message)
-        if not self._is_admin(user_id):
-            text = "⛔ 权限不足。"
-            if stream_id:
-                await self.ctx.send.text(text, stream_id)
-            return True, text, 2
+        if not self._is_admin(self._extract_user_id(message)):
+            return await self._send_and_return("权限不足。", stream_id)
         matched = kwargs.get("matched_groups", {})
-        identifier = self._extract_mention(message)
-        if identifier is None and matched.get("identifier"):
-            identifier = int(matched["identifier"])
+        identifier = self._resolve_identifier(message, matched)
         if identifier is None:
-            text = "格式错误。"
-            if stream_id:
-                await self.ctx.send.text(text, stream_id)
-            return True, text, 2
-        display_adjustment = float(matched.get("display_adjustment", "0"))
-        status, details = await self.core.adjust_balance_by_identifier(identifier, display_adjustment)
+            return await self._send_and_return("格式错误。", stream_id)
+        status, details = await self.core.adjust_balance_by_identifier(
+            identifier, float(matched.get("display_adjustment", "0"))
+        )
         if status == "SUCCESS":
-            text = f"✅ 成功！当前余额: {details['new_display_quota']:.2f}"
+            text = f"成功增加额度！当前余额: {details['new_display_quota']:.2f}"
+        elif status == "SUCCESS_BALANCE_UNKNOWN":
+            text = "额度已增加，但暂时无法读取最新余额。"
+        elif status == "INVALID_AMOUNT":
+            text = "调整失败：仅支持大于零的增加额度。"
+        elif status == "INVALID_QUOTA_RATIO":
+            text = "调整失败：额度展示比例配置无效。"
         else:
-            text = f"❌ 失败: {status}"
-        if stream_id:
-            await self.ctx.send.text(text, stream_id)
-        return True, text, 2
+            text = f"调整失败: {status}"
+        return await self._send_and_return(text, stream_id)
 
 
 def create_plugin():
