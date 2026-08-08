@@ -1,43 +1,65 @@
 # NewAPI Suite Plugin for MaiBot
 
-集成了核心用户管理与真实发额度签到功能的 NewAPI 插件套件，专为 MaiBot 1.1.3+ SDK v2 架构打造。
+MaiBot 的 NewAPI 管理插件，提供网站账号绑定、余额查询、每日签到，以及管理员查询、解绑和增加额度。
 
-## 功能特性
+## 功能
 
-- **核心绑定**：支持将 Discord / QQ 账号与 NewAPI 网站 ID 绑定，自动同步用户组。
-- **余额查询**：用户可随时通过 `/查询余额` 查看关联账号的当前额度。
-- **真实签到**：基于【管理员动态发码 + 用户身份自动 TopUp 核销】机制，签到额度实时充入网站真余额，账目留存可追溯；支持配置随机奖励、双倍概率及首次签到礼包。
-- **数据库防刷与回滚**：签到记录优先在 SQLite 本地锁定；若上游 API 网络出现故障，自动回滚签到状态，保障用户权益。
-- **管理工具**：
-  - `/查询 [@用户/ID]`：智能识别目标并显示绑定详情。
-  - `/解绑 [@用户/ID]`：强制解除账号绑定并自动恢复网站用户组。
-  - `/调整余额 [@用户/ID] [数额]`：手动增减用户额度。
-- **本地存储**：基于 SQLite (开启 WAL 并发模式)，无缝维护用户映射。
-- **消息拦截**：所有指令通过 MaiBot 新版 `@Command` 组件匹配触发，指令命中后拦截后续 AI 闲聊响应，节省 Token。
+- 绑定 Discord / QQ 平台用户与 NewAPI 网站用户 ID，并同步网站用户组。
+- 用户通过 `/查询余额` 查询绑定账户的真实余额。
+- 用户通过 `/签到` 获得随机、翻倍或首次签到奖励。
+- 签到和管理员加额都调用 NewAPI 的管理员原子调额接口 `POST /api/user/manage`，额度直接增加到绑定的网站用户 ID；不会创建兑换码，也不会以管理员身份代替用户核销兑换码。
+- 本地 SQLite 使用 WAL，网站用户 ID 具有唯一性；签到采用原子占位防止并发重复领取。
+- 管理员可使用 `/查询 [@用户/ID]`、`/解绑 [@用户/ID]`、`/调整余额 [@用户/ID] [正数]`。
 
 ## 环境要求
 
-- **MaiBot >= 1.1.3**（新版 Host/Runner 插件架构，`maibot_sdk` 插件 SDK）
-- **maibot-plugin-sdk >= 2.0.0**
+- MaiBot >= 1.1.3
+- MaiBot 随附的 `maibot-plugin-sdk`（建议 >= 2.7.1）
+- NewAPI 最新版，且配置的管理员 PAT 对目标网站用户拥有管理权限。
 
 ## 安装与配置
 
 1. 将本目录放入 MaiBot 的 `plugins` 文件夹。
 2. 启动 MaiBot，插件会被自动发现并加载。
-3. 在 WebUI 插件配置页（或插件目录自动生成的 `config.toml`）修改 API 连接信息：
-   - `api_base_url`：NewAPI 站点地址（如内部容器网桥 `http://172.17.0.1:3000` 或外部域名）
-   - `api_access_token`：API 全限访问令牌
-   - `api_admin_user_id`：管理员用户 ID Header (默认 `1`)
-4. 保存后配置支持动态热重载。
+3. 在 WebUI 插件配置页配置：
+   - `api_base_url`：NewAPI 站点地址。
+   - `api_access_token`：管理员 PAT 或访问令牌。
+   - `binding_group`：绑定成功后授予的用户组。
+   - `unbind_group`：解绑时恢复的用户组。
+   - `quota_display_ratio`：显示额度到 NewAPI 原始整数额度的换算比例，必须大于零。
+4. 也可在插件目录的运行时 `config.toml` `[api]` 段或 `.env` 中设置 `API_BASE_URL`、`API_ACCESS_TOKEN`。WebUI 配置优先。
+
+管理员 PAT 必须能够管理被绑定的网站用户；普通管理员不能管理同级或更高角色的账户。
+
+## 绑定说明
+
+`/绑定 <网站ID>` 保留为自助操作。它通过网站 ID 建立映射并调整该网站用户组，但聊天平台无法凭网站 ID 验证账户归属。请只在可信频道启用插件，或通过 `permission.mode`、白名单和管理员配置限制可用范围。
+
+## 开发验证
+
+安装依赖：
+
+```bash
+pip install -r requirements.txt
+```
+
+运行基础语法检查和核心回归测试：
+
+```bash
+python -m compileall plugin.py newapi_utils.py
+python -m unittest test_newapi_utils.py
+```
+
+插件依赖 MaiBot 的 Host/Runner 运行环境，最终验证应在非生产 NewAPI 测试账户中完成：确认管理员账户余额不变、绑定网站用户余额增加，并检查 NewAPI 管理日志中的 `add_quota` 操作。
 
 ## 目录结构
 
-```
+```text
 maibot_plugin_newapi/
-├── _manifest.json   # 插件清单（manifest_version 2）
-├── plugin.py        # 插件入口：配置模型、WebUI 元数据、生命周期、@Command 命令
-├── newapi_utils.py  # NewAPI 核心：SQLite 存储、API 交互、卡密核销、事务回滚
-└── config.toml      # 运行时配置文件（.gitignore）
+├── _manifest.json
+├── plugin.py
+├── newapi_utils.py
+└── test_newapi_utils.py
 ```
 
 ## 开源协议

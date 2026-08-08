@@ -5,47 +5,53 @@ import sqlite3
 import random
 import logging
 from datetime import datetime, timedelta
-from typing import Optional, Any, Dict, Tuple, List
+from decimal import Decimal, InvalidOperation
+from typing import Optional, Any, Dict, Tuple
 
 logger = logging.getLogger("newapi_suite")
 
+
 class NewApiCore:
-    """
-    NewAPI 核心工具类 (SQLite 原子锁 + 兑换码真实加额度模式)。
-    """
+    """NewAPI 核心工具类。"""
+
     def __init__(self, plugin, data_dir: Optional[str] = None):
         self.plugin = plugin
         if data_dir:
             self.db_path = os.path.join(data_dir, "newapi_data.db")
         else:
             self.db_path = os.path.join(os.path.dirname(__file__), "newapi_data.db")
-        self.api_base_url = None
-        self.api_access_token = None
-        self.api_admin_user_id = "1"
-        logger.info("[NewAPI Utils] 核心工具类已实例化，数据库路径: %s", self.db_path)
+        self.api_base_url = ""
+        self.api_access_token = ""
+        logger.info("[NewAPI Utils] 数据库路径: %s", self.db_path)
 
     @staticmethod
-    def _load_env_file(path: str) -> Dict[str, str]:
-        env: Dict[str, str] = {}
+    def _parse_key_value_line(line: str) -> Optional[Tuple[str, str]]:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            return None
+        key, _, value = line.partition("=")
+        return key.strip(), value.strip().strip('"').strip("'")
+
+    @classmethod
+    def _load_env_file(cls, path: str) -> Dict[str, str]:
         if not os.path.exists(path):
-            return env
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                env[key.strip()] = value.strip().strip('"').strip("'")
-        return env
+            return {}
+        with open(path, encoding="utf-8") as file:
+            return {
+                key: value
+                for line in file
+                if (entry := cls._parse_key_value_line(line)) is not None
+                for key, value in [entry]
+            }
 
     async def initialize(self) -> bool:
         self.refresh_config()
         try:
             os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
             await asyncio.to_thread(self._ensure_tables_exist_sync)
-            logger.info("✅ [NewAPI Utils] SQLite 数据库配置已就绪。")
-        except Exception as e:
-            logger.error("❌ [NewAPI Utils] 数据库初始化失败: %s", e, exc_info=True)
+            logger.info("[NewAPI Utils] SQLite 数据库已就绪。")
+        except Exception as error:
+            logger.error("[NewAPI Utils] 数据库初始化失败: %s", error, exc_info=True)
             return False
         if not self.api_base_url or not self.api_access_token:
             logger.warning("[NewAPI Utils] API 配置不完整，请在 WebUI 或 config.toml/.env 中配置")
@@ -55,45 +61,50 @@ class NewApiCore:
     def _load_config_toml(self, filepath: str) -> Dict[str, str]:
         if not os.path.exists(filepath):
             return {}
-        result = {}
+        result: Dict[str, str] = {}
         try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                content = f.read()
+            with open(filepath, "r", encoding="utf-8") as file:
+                content = file.read()
             in_api = False
             for line in content.splitlines():
                 line = line.strip()
                 if line == "[api]":
                     in_api = True
                     continue
-                elif line.startswith("[") and line.endswith("]"):
+                if line.startswith("[") and line.endswith("]"):
                     in_api = False
-                if in_api and "=" in line and not line.startswith("#"):
-                    k, v = line.split("=", 1)
-                    result[k.strip()] = v.strip().strip('"').strip("'")
-        except Exception as e:
-            logger.warning(f"读取 config.toml 异常: {e}")
+                entry = self._parse_key_value_line(line)
+                if in_api and entry:
+                    key, value = entry
+                    result[key] = value
+        except Exception as error:
+            logger.warning("读取 config.toml 异常: %s", error)
         return result
 
     def refresh_config(self) -> None:
         config = self.plugin.config.api
-        self.api_base_url = config.api_base_url or ""
-        self.api_access_token = config.api_access_token or ""
-        self.api_admin_user_id = config.api_admin_user_id or "1"
+        plugin_dir = os.path.dirname(__file__)
+        toml_data = self._load_config_toml(os.path.join(plugin_dir, "config.toml"))
+        env_data = self._load_env_file(os.path.join(plugin_dir, ".env"))
+        self.api_base_url = (
+            config.api_base_url
+            or toml_data.get("api_base_url")
+            or env_data.get("API_BASE_URL")
+            or ""
+        ).rstrip("/")
+        self.api_access_token = (
+            config.api_access_token
+            or toml_data.get("api_access_token")
+            or env_data.get("API_ACCESS_TOKEN")
+            or ""
+        )
 
-        if not self.api_base_url or not self.api_access_token:
-            plugin_dir = os.path.dirname(__file__)
-            toml_data = self._load_config_toml(os.path.join(plugin_dir, "config.toml"))
-            env_data = self._load_env_file(os.path.join(plugin_dir, ".env"))
-
-            self.api_base_url = self.api_base_url or toml_data.get("api_base_url") or env_data.get("API_BASE_URL", "http://172.17.0.1:3000")
-            self.api_access_token = self.api_access_token or toml_data.get("api_access_token") or env_data.get("API_ACCESS_TOKEN", "9PpvvEWCqdhIvZJglUi38qVcBB0BWknR")
-            self.api_admin_user_id = self.api_admin_user_id or toml_data.get("api_admin_user_id") or env_data.get("API_ADMIN_USER_ID", "1")
-
-    def _ensure_tables_exist_sync(self):
+    def _ensure_tables_exist_sync(self) -> None:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("PRAGMA journal_mode=WAL;")
-            cursor.execute("""
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS newapi_bindings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     qq_id INTEGER UNIQUE NOT NULL,
@@ -101,226 +112,282 @@ class NewApiCore:
                     binding_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_check_in_time TIMESTAMP
                 )
-            """)
+                """
+            )
+            columns = {
+                row[1] for row in cursor.execute("PRAGMA table_info(newapi_bindings)").fetchall()
+            }
+            if "last_check_in_time" not in columns:
+                cursor.execute("ALTER TABLE newapi_bindings ADD COLUMN last_check_in_time TIMESTAMP")
+            duplicates = cursor.execute(
+                """
+                SELECT website_user_id FROM newapi_bindings
+                GROUP BY website_user_id HAVING COUNT(*) > 1
+                """
+            ).fetchall()
+            if duplicates:
+                ids = ", ".join(str(row[0]) for row in duplicates)
+                raise RuntimeError(f"发现重复网站 ID 绑定，请先清理后再启动插件: {ids}")
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_newapi_bindings_website_user_id "
+                "ON newapi_bindings(website_user_id)"
+            )
             conn.commit()
 
-    async def execute_query(self, query: str, params: Tuple = (), fetch: str = 'none') -> Any:
-        def _sync_op():
+    async def execute_query(self, query: str, params: Tuple = (), fetch: str = "none") -> Any:
+        def sync_op():
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
-                q = query.replace('%s', '?')
-                cursor.execute(q, params)
-                if fetch == 'one':
+                cursor.execute(query.replace("%s", "?"), params)
+                if fetch == "one":
                     row = cursor.fetchone()
                     return dict(row) if row else None
-                elif fetch == 'all':
-                    return [dict(r) for r in cursor.fetchall()]
-                else:
-                    conn.commit()
-                    return cursor.rowcount
-        return await asyncio.to_thread(_sync_op)
+                if fetch == "all":
+                    return [dict(row) for row in cursor.fetchall()]
+                conn.commit()
+                return cursor.rowcount
 
-    async def api_request(self, method: str, endpoint: str, json_data: Optional[Dict] = None, custom_headers: Optional[Dict] = None) -> Optional[Dict]:
+        return await asyncio.to_thread(sync_op)
+
+    async def api_request(
+        self,
+        method: str,
+        endpoint: str,
+        json_data: Optional[Dict] = None,
+    ) -> Optional[Dict]:
         if not self.api_base_url or not self.api_access_token:
             return None
-        url = f"{self.api_base_url}{endpoint}"
         token = self.api_access_token
-        auth_header = token if token.startswith("Bearer ") else f"Bearer {token}"
-        headers = custom_headers or {
-            "Authorization": auth_header,
-            "New-Api-User": str(self.api_admin_user_id)
+        headers = {
+            "Authorization": token if token.startswith("Bearer ") else f"Bearer {token}",
         }
         try:
             async with httpx.AsyncClient(follow_redirects=True) as client:
-                response = await client.request(method, url, headers=headers, json=json_data, timeout=15.0)
+                response = await client.request(
+                    method,
+                    f"{self.api_base_url}{endpoint}",
+                    headers=headers,
+                    json=json_data,
+                    timeout=15.0,
+                )
                 response.raise_for_status()
                 return response.json()
-        except Exception as e:
-            logger.error(f"[NewAPI Utils] API 请求异常 ({endpoint}): {e}")
+        except Exception as error:
+            logger.error("[NewAPI Utils] API 请求异常 (%s): %s", endpoint, error)
             return None
 
-    # --- 核心签到发放逻辑 ---
+    @staticmethod
+    def _parse_time(value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+            except ValueError:
+                return None
+        return None
 
-    async def perform_check_in(self, qq_id: int, binding: Optional[Dict] = None) -> Tuple[str, Dict[str, Any]]:
-        """执行签到 (通过卡密生成与自动核销真实增加额度)"""
+    async def _claim_check_in(self, qq_id: int, offset_hours: int) -> Tuple[Optional[str], Optional[Any]]:
+        token = datetime.utcnow().isoformat(timespec="microseconds")
+        local_today = (datetime.utcnow() + timedelta(hours=offset_hours)).date()
+
+        def sync_op():
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+                row = cursor.execute(
+                    "SELECT last_check_in_time FROM newapi_bindings WHERE qq_id = ?", (qq_id,)
+                ).fetchone()
+                if not row:
+                    return None, None
+                previous = row[0]
+                last_time = self._parse_time(previous)
+                if last_time and (last_time + timedelta(hours=offset_hours)).date() == local_today:
+                    return None, previous
+                cursor.execute(
+                    "UPDATE newapi_bindings SET last_check_in_time = ? WHERE qq_id = ?",
+                    (token, qq_id),
+                )
+                conn.commit()
+                return token, previous
+
+        return await asyncio.to_thread(sync_op)
+
+    async def _restore_check_in_claim(self, qq_id: int, token: str, previous: Optional[Any]) -> None:
+        if previous is None:
+            query = (
+                "UPDATE newapi_bindings SET last_check_in_time = NULL "
+                "WHERE qq_id = %s AND last_check_in_time = %s"
+            )
+            params = (qq_id, token)
+        else:
+            query = (
+                "UPDATE newapi_bindings SET last_check_in_time = %s "
+                "WHERE qq_id = %s AND last_check_in_time = %s"
+            )
+            params = (str(previous), qq_id, token)
+        await self.execute_query(query, params)
+
+    def _quota_ratio(self) -> Optional[float]:
+        ratio = self.plugin.config.binding.quota_display_ratio
+        return ratio if ratio > 0 else None
+
+    async def add_api_user_quota(self, website_user_id: int, raw_amount: int) -> bool:
+        if raw_amount <= 0:
+            return False
+        response = await self.api_request(
+            "POST",
+            "/api/user/manage",
+            {
+                "id": website_user_id,
+                "action": "add_quota",
+                "mode": "add",
+                "value": raw_amount,
+            },
+        )
+        return bool(response and response.get("success"))
+
+    async def perform_check_in(self, qq_id: int) -> Tuple[str, Dict[str, Any]]:
         check_in_conf = self.plugin.config.check_in
         if not check_in_conf.enabled:
             return "DISABLED", {}
-        if not binding:
-            binding = await self.get_user_by_qq(qq_id)
+        binding = await self.get_user_by_qq(qq_id)
         if not binding:
             return "NOT_BOUND", {}
+        ratio = self._quota_ratio()
+        if ratio is None:
+            return "INVALID_QUOTA_RATIO", {}
 
-        offset_hours = check_in_conf.timezone_offset_hours
-        time_delta = timedelta(hours=offset_hours)
-        local_today = (datetime.utcnow() + time_delta).date()
-        
-        # 1. 检查签到记录
-        raw_last_time = binding.get('last_check_in_time')
-        last_check_in_time = raw_last_time
-        if last_check_in_time:
-            if isinstance(last_check_in_time, str):
-                try:
-                    last_check_in_time = datetime.fromisoformat(last_check_in_time.replace('Z', '+00:00'))
-                except:
-                    pass
-            if (last_check_in_time + time_delta).date() == local_today:
-                return "ALREADY_CHECKED_IN", {}
+        claim_token, previous_time = await self._claim_check_in(
+            qq_id, check_in_conf.timezone_offset_hours
+        )
+        if claim_token is None:
+            return "ALREADY_CHECKED_IN", {}
 
-        # 2. 计算奖励
-        ratio = self.plugin.config.binding.quota_display_ratio
         is_doubled = random.random() < check_in_conf.double_chance
-        base_display_quota = random.uniform(check_in_conf.min_display_quota, check_in_conf.max_display_quota)
-        is_first = last_check_in_time is None
+        base_display_quota = random.uniform(
+            check_in_conf.min_display_quota, check_in_conf.max_display_quota
+        )
+        is_first = previous_time is None
         bonus_quota = (
             int(check_in_conf.first_check_in_bonus_display_quota * ratio)
             if is_first and check_in_conf.first_check_in_bonus_enabled
             else 0
         )
-        final_raw_quota = int(base_display_quota * ratio) * (2 if is_doubled else 1) + bonus_quota
+        raw_amount = int(base_display_quota * ratio) * (2 if is_doubled else 1) + bonus_quota
+        if raw_amount <= 0:
+            await self._restore_check_in_claim(qq_id, claim_token, previous_time)
+            return "INVALID_AMOUNT", {}
 
-        # 3. 先写本地数据库锁定状态 (防刷)
-        await self.set_check_in_time(qq_id)
-        logger.info(f"[NewAPI CheckIn] 用户 {qq_id} 已在本地锁定签到状态，准备充值发放额度: {final_raw_quota}")
+        website_user_id = binding["website_user_id"]
+        if not await self.add_api_user_quota(website_user_id, raw_amount):
+            await self._restore_check_in_claim(qq_id, claim_token, previous_time)
+            return "API_UPDATE_FAILED", {"site_id": website_user_id}
 
-        # 4. 生成卡密
-        website_user_id = binding['website_user_id']
-        token = self.api_access_token
-        auth_header = token if token.startswith("Bearer ") else f"Bearer {token}"
-        admin_headers = {
-            "Authorization": auth_header,
-            "New-Api-User": str(self.api_admin_user_id)
-        }
-        ts_suffix = str(int(datetime.utcnow().timestamp()))[-6:]
-        redemption_name = f"c_{website_user_id}_{ts_suffix}"[:20]
-        redemption_payload = {
-            "name": redemption_name,
-            "quota": final_raw_quota,
-            "count": 1
-        }
-        redemption_resp = await self.api_request("POST", "/api/redemption/", json_data=redemption_payload, custom_headers=admin_headers)
-        if not redemption_resp or not redemption_resp.get("success") or not redemption_resp.get("data"):
-            logger.error(f"❌ [NewAPI CheckIn] 用户 {qq_id} 生成兑换码失败: {redemption_resp}")
-            await self.restore_check_in_time(qq_id, raw_last_time)
-            return "API_UNREACHABLE", {}
-
-        code = redemption_resp.get("data")[0]
-
-        # 5. 自动以用户身份核销卡密
-        user_headers = {
-            "Authorization": auth_header,
-            "New-Api-User": str(website_user_id)
-        }
-        topup_resp = await self.api_request("POST", "/api/user/topup", json_data={"key": code}, custom_headers=user_headers)
-        if not topup_resp or not topup_resp.get("success"):
-            logger.error(f"❌ [NewAPI CheckIn] 用户 {qq_id} 核销卡密失败: {topup_resp}")
-            await self.restore_check_in_time(qq_id, raw_last_time)
-            return "API_UPDATE_FAILED", {"site_id": website_user_id, "quota_owed": final_raw_quota}
-
-        # 6. 查询最新余额
         user_data = await self.get_api_user_data(website_user_id)
-        current_total_display = (user_data.get("quota", 0) / ratio) if user_data else 0.0
-
-        return "SUCCESS", {
+        details = {
             "is_first": is_first,
             "is_doubled": is_doubled,
-            "display_added": final_raw_quota / ratio,
-            "display_total": current_total_display,
+            "display_added": raw_amount / ratio,
             "user_id": qq_id,
             "site_id": website_user_id,
         }
+        if not user_data:
+            return "SUCCESS_BALANCE_UNKNOWN", details
+        details["display_total"] = user_data.get("quota", 0) / ratio
+        return "SUCCESS", details
 
-    # --- 辅助绑定查询与方法 ---
-    async def get_user_by_qq(self, qq_id: int) -> Optional[Dict]: 
-        result = await self.execute_query("SELECT * FROM newapi_bindings WHERE qq_id = %s", (qq_id,), fetch='one')
-        if result and result.get('binding_time') and isinstance(result['binding_time'], str):
-            try: result['binding_time'] = datetime.fromisoformat(result['binding_time'].replace('Z', '+00:00'))
-            except: pass
-        if result and result.get('last_check_in_time') and isinstance(result['last_check_in_time'], str):
-            try: result['last_check_in_time'] = datetime.fromisoformat(result['last_check_in_time'].replace('Z', '+00:00'))
-            except: pass
+    async def get_user_by_qq(self, qq_id: int) -> Optional[Dict]:
+        result = await self.execute_query(
+            "SELECT * FROM newapi_bindings WHERE qq_id = %s", (qq_id,), fetch="one"
+        )
+        if result:
+            for field in ("binding_time", "last_check_in_time"):
+                if result.get(field):
+                    parsed = self._parse_time(result[field])
+                    if parsed:
+                        result[field] = parsed
         return result
 
-    async def get_user_by_website_id(self, website_user_id: int) -> Optional[Dict]: 
-        return await self.execute_query("SELECT * FROM newapi_bindings WHERE website_user_id = %s", (website_user_id,), fetch='one')
+    async def get_user_by_website_id(self, website_user_id: int) -> Optional[Dict]:
+        return await self.execute_query(
+            "SELECT * FROM newapi_bindings WHERE website_user_id = %s",
+            (website_user_id,),
+            fetch="one",
+        )
 
     async def get_api_user_data(self, user_id: int) -> Optional[Dict]:
         response = await self.api_request("GET", f"/api/user/{user_id}")
-        if response and response.get("success"): return response.get("data")
-        return None
+        return response.get("data") if response and response.get("success") else None
 
     async def update_api_user(self, user_profile: Dict) -> bool:
-        response = await self.api_request("PUT", "/api/user/", json_data=user_profile)
-        return response and response.get("success", False)
+        response = await self.api_request("PUT", "/api/user/", user_profile)
+        return bool(response and response.get("success"))
 
-    async def insert_binding(self, qq_id: int, website_user_id: int) -> int: 
-        return await self.execute_query("INSERT INTO newapi_bindings (qq_id, website_user_id) VALUES (%s, %s)", (qq_id, website_user_id))
+    async def insert_binding(self, qq_id: int, website_user_id: int) -> bool:
+        def sync_op():
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.execute(
+                        "INSERT INTO newapi_bindings (qq_id, website_user_id) VALUES (?, ?)",
+                        (qq_id, website_user_id),
+                    )
+                return True
+            except sqlite3.IntegrityError:
+                return False
 
-    async def delete_binding(self, *, qq_id: Optional[int] = None, website_user_id: Optional[int] = None) -> int:
-        if qq_id: return await self.execute_query("DELETE FROM newapi_bindings WHERE qq_id = %s", (qq_id,))
-        if website_user_id: return await self.execute_query("DELETE FROM newapi_bindings WHERE website_user_id = %s", (website_user_id,))
-        return 0
+        return await asyncio.to_thread(sync_op)
 
-    async def set_check_in_time(self, qq_id: int) -> None:
-        now_str = datetime.utcnow().isoformat()
-        await self.execute_query("UPDATE newapi_bindings SET last_check_in_time = %s WHERE qq_id = %s", (now_str, qq_id))
-
-    async def restore_check_in_time(self, qq_id: int, previous_time: Optional[Any]) -> None:
-        if previous_time is None:
-            query = "UPDATE newapi_bindings SET last_check_in_time = NULL WHERE qq_id = %s"
-            params = (qq_id,)
-        else:
-            query = "UPDATE newapi_bindings SET last_check_in_time = %s WHERE qq_id = %s"
-            params = (str(previous_time), qq_id)
-        await self.execute_query(query, params)
+    async def delete_binding(self, website_user_id: int) -> int:
+        return await self.execute_query(
+            "DELETE FROM newapi_bindings WHERE website_user_id = %s", (website_user_id,)
+        )
 
     async def revert_user_group(self, website_user_id: int) -> bool:
-        api_user_data = await self.get_api_user_data(website_user_id)
-        if not api_user_data: return False
-        revert_group = self.plugin.config.binding.binding_group
-        if api_user_data.get('group') != revert_group:
-            api_user_data['group'] = revert_group
-            return await self.update_api_user(api_user_data)
-        return True
+        user_data = await self.get_api_user_data(website_user_id)
+        if not user_data:
+            return False
+        revert_group = self.plugin.config.binding.unbind_group
+        if user_data.get("group") == revert_group:
+            return True
+        user_data["group"] = revert_group
+        return await self.update_api_user(user_data)
 
     async def purge_user_binding(self, website_user_id: int) -> Tuple[bool, Optional[Dict]]:
         binding_info = await self.get_user_by_website_id(website_user_id)
-        if not binding_info: return False, None
-        await self.revert_user_group(website_user_id)
-        return await self.delete_binding(website_user_id=website_user_id) > 0, binding_info
+        if not binding_info or not await self.revert_user_group(website_user_id):
+            return False, binding_info
+        return await self.delete_binding(website_user_id) > 0, binding_info
 
-    async def lookup_binding(self, identifier: int) -> Tuple[str, Optional[Dict]]:
-        binding = await self.get_user_by_website_id(identifier)
-        if binding: return "WEBSITE_ID", binding
-        binding = await self.get_user_by_qq(identifier)
-        if binding: return "QQ_ID", binding
-        return "NOT_FOUND", None
+    async def lookup_binding(self, identifier: int) -> Optional[Dict]:
+        return await self.get_user_by_website_id(identifier) or await self.get_user_by_qq(identifier)
 
-    async def adjust_balance_by_identifier(self, identifier: int, display_adjustment: float) -> Tuple[str, Optional[Dict]]:
-        id_type, binding = await self.lookup_binding(identifier)
-        if id_type == "NOT_FOUND": return "USER_NOT_FOUND", None
-        website_user_id = binding['website_user_id']
-        ratio = self.plugin.config.binding.quota_display_ratio
-        raw_amount = int(display_adjustment * ratio)
+    async def adjust_balance_by_identifier(
+        self, identifier: int, display_adjustment: float
+    ) -> Tuple[str, Optional[Dict]]:
+        binding = await self.lookup_binding(identifier)
+        if not binding:
+            return "USER_NOT_FOUND", None
+        ratio = self._quota_ratio()
+        if ratio is None:
+            return "INVALID_QUOTA_RATIO", None
+        try:
+            amount = Decimal(str(display_adjustment)) * Decimal(str(ratio))
+        except (InvalidOperation, ValueError):
+            return "INVALID_AMOUNT", {"website_user_id": binding["website_user_id"]}
+        if amount != amount.to_integral_value():
+            return "INVALID_AMOUNT", {"website_user_id": binding["website_user_id"]}
+        raw_amount = int(amount)
         if raw_amount <= 0:
+            return "INVALID_AMOUNT", {"website_user_id": binding["website_user_id"]}
+        website_user_id = binding["website_user_id"]
+        if not await self.add_api_user_quota(website_user_id, raw_amount):
             return "API_UPDATE_FAILED", {"website_user_id": website_user_id}
-            
-        token = self.api_access_token
-        auth_header = token if token.startswith("Bearer ") else f"Bearer {token}"
-        admin_headers = {"Authorization": auth_header, "New-Api-User": str(self.api_admin_user_id)}
-        user_headers = {"Authorization": auth_header, "New-Api-User": str(website_user_id)}
-        
-        ts_suffix = str(int(datetime.utcnow().timestamp()))[-6:]
-        red_name = f"adj_{website_user_id}_{ts_suffix}"[:20]
-        red_resp = await self.api_request("POST", "/api/redemption/", json_data={"name": red_name, "quota": raw_amount, "count": 1}, custom_headers=admin_headers)
-        if not red_resp or not red_resp.get("success") or not red_resp.get("data"):
-            return "API_UPDATE_FAILED", {"website_user_id": website_user_id}
-        code = red_resp["data"][0]
-        topup_resp = await self.api_request("POST", "/api/user/topup", json_data={"key": code}, custom_headers=user_headers)
-        if not topup_resp or not topup_resp.get("success"):
-            return "API_UPDATE_FAILED", {"website_user_id": website_user_id}
-            
         user_data = await self.get_api_user_data(website_user_id)
-        new_disp = (user_data.get("quota", 0) / ratio) if user_data else 0.0
-        return "SUCCESS", {"website_user_id": website_user_id, "new_display_quota": new_disp}
+        if not user_data:
+            return "SUCCESS_BALANCE_UNKNOWN", {"website_user_id": website_user_id}
+        return "SUCCESS", {
+            "website_user_id": website_user_id,
+            "new_display_quota": user_data.get("quota", 0) / ratio,
+        }

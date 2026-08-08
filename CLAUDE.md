@@ -1,43 +1,55 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working in this repository.
 
 ## 项目概述
 
-这是 MaiBot 的插件（`newapi_suite`，插件 ID `future-404.maibot-plugin-newapi`），为用户提供 NewAPI 网站的用户绑定、余额查询、每日签到和"打劫"娱乐功能。
+这是 MaiBot 的 `newapi_suite` 管理插件（插件 ID `future-404.maibot-plugin-newapi`），用于把平台用户 ID 与 NewAPI 网站用户绑定，并提供余额查询、每日签到和管理员余额调整/解绑工具。
 
-插件基于**新版 Host/Runner 插件架构**（`maibot-plugin-sdk`，import 名 `maibot_sdk`）：插件运行在独立子进程（Runner）中，通过 msgpack RPC 与 MaiBot 主进程通信。**插件代码不得 import `src.*`**，只能通过 `maibot_sdk` 及其 `self.ctx` 能力代理访问宿主能力。
+插件使用 MaiBot >= 1.1.3 的 Host/Runner 架构和 `maibot-plugin-sdk >= 2.0.0`。插件在独立 Runner 进程中运行，通过 SDK 的 `self.ctx` 与宿主通信。源码不得导入 MaiBot 的 `src.*`，只使用 `maibot_sdk` 及插件上下文能力。
 
-## 运行与开发
+## 开发与验证
 
-没有构建、lint 或测试体系。运行依赖：
+仓库没有构建、lint 或测试配置，也没有可独立运行的入口。依赖项为：
 
-- MaiBot >= 1.1.3（新版插件架构）
-- `maibot-plugin-sdk`（`pip install maibot-plugin-sdk`）
-- `httpx`（在 `_manifest.json` 的 `dependencies` 中声明，Runner 自动安装）
+```bash
+pip install -r requirements.txt
+```
 
-安装：把整个目录放入 MaiBot 的 `plugins/` 文件夹，启动 MaiBot 即自动加载。开发时无法脱离 MaiBot 环境直接运行；改动通过日志（logger 名 `newapi_suite` / `newapi_heist`）在 MaiBot 内验证。
+其中 `requirements.txt` 声明 `maibot-plugin-sdk>=2.0.0` 和 `httpx>=0.24.0`；安装到 MaiBot 时，`_manifest.json` 也会让 Runner 自动安装 `httpx`。
+
+可以用下面的命令做基础语法检查，但它不替代 MaiBot 集成验证：
+
+```bash
+python -m compileall plugin.py newapi_utils.py
+```
+
+实际验证方式是把整个目录放到 MaiBot 的 `plugins/` 目录后启动 MaiBot，查看插件日志（`newapi_suite`）。插件无法脱离 MaiBot 环境直接运行，因为 `plugin.py` 依赖 `maibot_sdk` 和宿主上下文。配置可在 WebUI 插件配置页修改，或使用运行时生成的 `config.toml`；配置更新通过 `on_config_update` 动态刷新 API 连接。
 
 ## 架构
 
-- **`plugin.py`** — 入口。`NewApiSuitePlugin(MaiBotPlugin)`：
-  - `config_model = NewApiSuiteConfig`（`PluginConfigBase` 嵌套模型，定义全部配置与 WebUI Schema）
-  - 生命周期：`on_load()` 初始化 `NewApiCore` 与 `HeistLogic`；`on_config_update(scope="self")` 调用 `core.refresh_config()`
-  - 全部命令用 `@Command(name, pattern=...)` 声明（`cmd_*` 方法），处理函数从 `**kwargs` 取 `stream_id` / `matched_groups` / `message`，返回三元组 `(success, response, weight)`。命令命中即执行，不再触发 LLM 回复（这是新版 `@Command` 的天然行为，替代了旧版 stealth dispatcher）
-  - `message` 是 dict，字段与旧版 `MaiMessages` 兼容：`user_info.user_id`、`message_info.user_info.user_id`、`message_base_info.group_id`、`message_segments[]`（at 段取 `data.user_id` / `data.target_user_id`）。`plugin.py` 提供了 `_extract_user_id` / `_extract_mention` / `_is_group_message` 等兼容提取辅助
-  - 发送统一走 `self.ctx.send.text(text, stream_id)`，`stream_id` 直接来自 `kwargs`
-- **`newapi_utils.py`** — `NewApiCore` 数据与 API 层。SQLite（WAL 模式）数据库文件位于 `self.ctx.paths.data_dir / "newapi_data.db"`；httpx 异步客户端访问 NewAPI（请求头 `Authorization` + `New-Api-User`）。
-  - **额度表示**：NewAPI 返回的 `quota` 是整数原始值，显示额度 = `quota / binding.quota_display_ratio`（默认 500000）。配置中所有数值均为"显示额度"，代码内乘回比例
-  - **签到的防刷设计**：`perform_check_in` 刻意"先本地写 `last_check_in_time` 锁定、后调 API 发奖"。即使 API 挂了用户也无法重复签到，安全优先于体验
-  - **资金转移**：`_transfer_quota` 采用"双向确认"（先扣款后加款），加款失败时 3 次重试回滚，仍失败则写入 `pending_api_tasks` 表待人工补偿。任何改动额度流程务必沿用这一补偿机制
-  - API 连接配置从 `plugin.config.api`（config_model）读取；若为空，回退解析插件目录的 `.env`（`API_BASE_URL` / `API_ACCESS_TOKEN` / `API_ADMIN_USER_ID`），兼容旧版部署
-- **`heist_logic.py`** — `HeistLogic` 打劫小游戏。`execute_heist` 分三步：`_validate_heist_conditions`（启用开关、绑定、冷却、每日发起/被劫上限、自劫检查）→ `_determine_heist_outcome`（失败/成功/暴击判定）→ `_execute_heist_transfer`（走 `core.transfer_display_quota` 划转并记录 `daily_heist_log`）。暴击时先全额转移 `allow_partial=True`，再用"实际获得 > 基础额度"判定最终是否算暴击
+- **`plugin.py`** 是插件入口。
+  - `NewApiSuiteConfig` 由 `PluginConfigBase` 的嵌套配置段组成：`api`、`permission`、`binding`、`check_in`、`pm`。
+  - `NewApiSuitePlugin.on_load()` 从 `self.ctx` 读取配置和数据目录，创建并初始化 `NewApiCore`；`on_config_update()` 更新配置并调用核心的 `refresh_config()`。
+  - 用户和管理员指令通过 SDK 的 `@Command` 声明。命令处理器从 `kwargs` 获取 `message`、`stream_id` 和 `matched_groups`，通过 `self.ctx.send.text(text, stream_id)` 发送回复，并返回 `(success, response, weight)`。
+  - `_extract_user_id()`、`_extract_mention()` 和 `_extract_stream_id()` 兼容多种 MaiBot/平台消息字典结构。权限统一由 `_permission_allowed()` 和 `_is_admin()` 检查：普通命令受频道模式和私聊开关约束，管理员命令还要求发送者位于 `permission.admin_users`。
+  - 当前命令为：`/查询余额`、`/绑定 <网站ID>`、`/签到`、管理员 `/查询 <ID或@用户>`、管理员 `/解绑 <ID或@用户>`、管理员 `/调整余额 <ID或@用户> <数额>`。
 
-## 需要注意的点
+- **`newapi_utils.py`** 提供 `NewApiCore`，负责本地数据、NewAPI HTTP 请求和额度业务。
+  - SQLite 数据库默认为 `self.ctx.paths.data_dir / "newapi_data.db"`，建表时启用 WAL。核心表 `newapi_bindings` 保存平台用户 ID、网站用户 ID、绑定时间和最近签到时间。
+  - `execute_query()` 通过 `asyncio.to_thread()` 执行同步 SQLite 操作，查询结果转换为字典；不要在命令处理器中直接操作数据库。
+  - `api_request()` 仅使用管理员 PAT 的 `Authorization: Bearer ...` 请求头访问 NewAPI。API 配置优先读取 `plugin.config.api`，缺失时兼容插件目录下的 `config.toml` `[api]` 段和 `.env`（`API_BASE_URL`、`API_ACCESS_TOKEN`）。不要把令牌写入源码或提交内容。
+  - NewAPI 的 `quota` 是原始整数额度；用户可见额度使用 `quota / binding.quota_display_ratio`，配置中的签到和调整数值均为可见额度，写回 API 前必须乘以该比例。展示比例必须大于零。
+  - `perform_check_in()` 使用 SQLite 事务原子抢占当天签到资格，计算随机/翻倍/首次奖励后，通过管理员 `POST /api/user/manage` 的 `add_quota` 操作将额度直接加入绑定网站用户。远端调额失败时仅回滚本次占位；余额读取失败不影响已成功的入账。
+  - `adjust_balance_by_identifier()` 当前只接受正额度，通过同一管理员 `add_quota` 操作完成加额；负数或零会返回本地无效额度状态。不要将它误认为支持扣款或双向资金转移。
 
-- **配置访问**：所有配置通过强类型 `self.plugin.config.xxx`（如 `config.binding.quota_display_ratio`、`config.check_in.enabled`）读取，字段名与旧版 `config_schema` 的 section 一致（`permission_settings`→`permission`、`check_in_settings`→`check_in`、`heist_settings`→`heist`）。新增的 `api` section 存 API 密钥
-- **权限控制**：`permission.admin_list`（管理员）、`permission.allowed_groups`（允许频道，留空全放行）、`permission.enable_private_chat`（私聊开关），在 `plugin.py` 的 `_permission_allowed` / `_is_admin` 中统一校验
-- **配置变更**：新增配置字段时在 `plugin.py` 的 `PluginConfigBase` 中声明即可，Runner 会自动补齐默认值；数据库建表在 `NewApiCore._ensure_tables_exist_sync`
-- `_manifest.json` 为 `manifest_version: 2`，`host_application.min_version` 与 `sdk` 区间决定了插件能在哪些 MaiBot 版本加载，升级 SDK 大版本时需同步调整
-- `config.toml`、`.env`、`*.db`、`docs/`、`sdk.zip`、`sdk_src/` 为运行时生成物或调研产物，均不参与插件运行
-- 源码注释与用户可见文案均为中文，新增内容请保持一致
+## 关键约束
+
+- 配置访问使用强类型对象，例如 `self.config.api`、`self.config.permission`、`self.config.binding` 和 `self.config.check_in`，不要恢复旧版扁平 `config_schema` 或旧 dispatcher 写法。
+- 数据库和配置属于运行时数据：`*.db`、`.env`、`config.toml` 已被 `.gitignore` 排除，不参与插件发布。
+- 修改 `_manifest.json` 的宿主版本或 SDK 版本范围时要同步考虑 MaiBot 插件加载兼容性。当前清单是 `manifest_version: 2`、MaiBot `1.1.3` 起、SDK `2.0.0` 起，插件能力声明为 `send.text`。MaiBot 1.1.3 实际随附 SDK 版本应以宿主为准，配置热更新回调签名为 `(scope, config_data, version)`。
+- 源码注释和用户可见文案使用中文；新增配置字段应直接加入 `NewApiSuiteConfig` 对应的配置段，并考虑 WebUI 字段元数据。
+
+## 安装配置要点
+
+将仓库目录放入 MaiBot 的 `plugins/` 后启动即可自动发现。至少需要配置 NewAPI 基础 URL 和具备管理权限的 API 访问令牌；若要启用插件管理员指令，还需在权限设置中配置允许的 MaiBot 管理员 ID。主要业务配置包括权限模式（`all`、`whitelist`、`blacklist`）、绑定后/解绑后的用户组、额度展示比例、签到奖励规则和私聊开关。
