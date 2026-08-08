@@ -29,7 +29,7 @@ python -m compileall plugin.py newapi_utils.py
 ## 架构
 
 - **`plugin.py`** 是插件入口。
-  - `NewApiSuiteConfig` 由 `PluginConfigBase` 的嵌套配置段组成：`api`、`permission`、`binding`、`check_in`、`pm`。
+  - `NewApiSuiteConfig` 由 `PluginConfigBase` 的嵌套配置段组成：`plugin`、`api`、`permission`、`binding`、`check_in`、`pm`。`plugin.config_version` 必须保留，用于 MaiBot 配置文件解析。
   - `NewApiSuitePlugin.on_load()` 从 `self.ctx` 读取配置和数据目录，创建并初始化 `NewApiCore`；`on_config_update()` 更新配置并调用核心的 `refresh_config()`。
   - 用户和管理员指令通过 SDK 的 `@Command` 声明。命令处理器从 `kwargs` 获取 `message`、`stream_id` 和 `matched_groups`，通过 `self.ctx.send.text(text, stream_id)` 发送回复，并返回 `(success, response, weight)`。
   - `_extract_user_id()`、`_extract_mention()` 和 `_extract_stream_id()` 兼容多种 MaiBot/平台消息字典结构。权限统一由 `_permission_allowed()` 和 `_is_admin()` 检查：普通命令受频道模式和私聊开关约束，管理员命令还要求发送者位于 `permission.admin_users`。

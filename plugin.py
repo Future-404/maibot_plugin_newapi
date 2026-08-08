@@ -10,6 +10,15 @@ from .newapi_utils import NewApiCore
 logger = logging.getLogger("newapi_suite")
 
 
+class PluginSection(PluginConfigBase):
+    __ui_label__ = "插件基础设施"
+    __ui_icon__ = "settings"
+    __ui_order__ = 1
+
+    enabled: bool = Field(default=True, description="是否启用插件")
+    config_version: str = Field(default="2.1.0", description="配置规范版本")
+
+
 class ApiSettings(PluginConfigBase):
     __ui_label__ = "NewAPI 连接设置"
     __ui_icon__ = "link"
@@ -75,6 +84,7 @@ class OptionalPmSettings(PluginConfigBase):
 
 
 class NewApiSuiteConfig(PluginConfigBase):
+    plugin: PluginSection = Field(default_factory=PluginSection)
     api: ApiSettings = Field(default_factory=ApiSettings)
     permission: PermissionSettings = Field(default_factory=PermissionSettings)
     binding: BindingSettings = Field(default_factory=BindingSettings)
