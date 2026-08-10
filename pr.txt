@@ -1,0 +1,22 @@
+PR 标题：修复：通过管理员额度接口向绑定用户发放余额
+
+## 概要
+
+- 使用 NewAPI 管理员 `add_quota` 操作替代兑换码核销和身份伪装，额度直接写入绑定的网站用户。
+- 将每日签到改为 SQLite 原子抢占，避免并发重复发放。
+- 增加旧数据库迁移与网站用户 ID 唯一性保护。
+- 修正绑定和解绑的用户组处理与远端失败保留逻辑。
+- 修正配置热更新、私聊判断、Discord/OneBot 提及解析和额度精度校验。
+- 插件版本升级至 `2.2.0`。
+- 更新 README、CLAUDE.md，并新增核心回归测试。
+
+## 验证
+
+```bash
+python -m unittest -v test_newapi_utils.py
+python -m compileall plugin.py newapi_utils.py test_newapi_utils.py
+```
+
+测试结果：10 项测试全部通过。
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)

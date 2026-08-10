@@ -7,7 +7,8 @@ MaiBot 的 NewAPI 管理插件，提供网站账号绑定、余额查询、每�
 - 绑定 Discord / QQ 平台用户与 NewAPI 网站用户 ID，并同步网站用户组。
 - 用户通过 `/查询余额` 查询绑定账户的真实余额。
 - 用户通过 `/签到` 获得随机、翻倍或首次签到奖励。
-- 签到和管理员加额都调用 NewAPI 的管理员原子调额接口 `POST /api/user/manage`，额度直接增加到绑定的网站用户 ID；不会创建兑换码，也不会以管理员身份代替用户核销兑换码。
+- 用户通过 `/打劫 @用户` 进行可配置概率的余额转移；成功可能获得双倍额度，失败会按规则赔付对方并进入通缉状态。
+- 签到、打劫和管理员加额都调用 NewAPI 的管理员原子调额接口 `POST /api/user/manage`。
 - 本地 SQLite 使用 WAL，网站用户 ID 具有唯一性；签到采用原子占位防止并发重复领取。
 - 管理员可使用 `/查询 [@用户/ID]`、`/解绑 [@用户/ID]`、`/调整余额 [@用户/ID] [正数]`。
 
@@ -27,6 +28,14 @@ MaiBot 的 NewAPI 管理插件，提供网站账号绑定、余额查询、每�
    - `binding_group`：绑定成功后授予的用户组。
    - `unbind_group`：解绑时恢复的用户组。
    - `quota_display_ratio`：显示额度到 NewAPI 原始整数额度的换算比例，必须大于零。
+   - `robbery.enabled`：是否启用打劫。
+   - `robbery.success_chance` / `double_chance`：成功概率与双倍概率。
+   - `robbery.base_display_quota`：成功时的基础转移额度。
+   - `robbery.cooldown_seconds` / `wanted_seconds`：成功冷却和失败通缉时间。
+   - `robbery.failure_penalty_ratio` / `failure_penalty_max_display_quota`：失败时从打劫者余额赔付给对方的比例和上限。
+   - 打劫结果文案：`robbery` 下的 `*_template` 字段可在 WebUI 中配置，覆盖功能关闭、绑定校验、余额不足、结算、冷却、通缉、成功及失败提示。
+     - 可用变量：`{wait_seconds}`、`{display_amount:.2f}`、`{display_total:.2f}`、`{wanted_seconds}`、`{status}`。
+     - 模板字段缺失或格式错误时，插件会使用内置中文文案，确保命令仍可回复。
 4. 也可在插件目录的运行时 `config.toml` `[api]` 段或 `.env` 中设置 `API_BASE_URL`、`API_ACCESS_TOKEN`。WebUI 配置优先。
 
 管理员 PAT 必须能够管理被绑定的网站用户；普通管理员不能管理同级或更高角色的账户。

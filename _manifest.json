@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "future-404.maibot-plugin-newapi",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "name": "NewAPI 插件套件",
   "description": "集成了核心用户管理与娱乐功能的 New API 插件套件，专为 MaiBot 环境优化移植。",
   "author": {

@@ -16,7 +16,7 @@ class PluginSection(PluginConfigBase):
     __ui_order__ = 1
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="2.1.0", description="配置规范版本")
+    config_version: str = Field(default="2.2.0", description="配置规范版本")
 
 
 class ApiSettings(PluginConfigBase):
@@ -75,10 +75,48 @@ class CheckInSettings(PluginConfigBase):
     )
 
 
+class RobberySettings(PluginConfigBase):
+    __ui_label__ = "打劫规则与文案"
+    __ui_icon__ = "sword"
+    __ui_order__ = 6
+
+    enabled: bool = Field(default=True, description="是否启用打劫功能")
+    success_chance: float = Field(default=0.5, ge=0, le=1, description="打劫成功概率")
+    double_chance: float = Field(default=0.1, ge=0, le=1, description="成功后获得双倍额度的概率")
+    base_display_quota: float = Field(default=10.0, gt=0, description="普通成功时转移的额度")
+    cooldown_seconds: int = Field(default=300, ge=0, description="成功后的冷却秒数")
+    failure_penalty_ratio: float = Field(default=0.1, ge=0, le=1, description="失败时按当前余额赔付的比例")
+    failure_penalty_max_display_quota: float = Field(
+        default=10.0, ge=0, description="失败赔付额度上限，0 表示不设上限"
+    )
+    wanted_seconds: int = Field(default=600, ge=0, description="失败后的通缉秒数")
+    disabled_template: str = Field(default="打劫功能暂未开启。", description="功能关闭模板")
+    self_target_template: str = Field(default="不能打劫自己哦！", description="目标为自己模板")
+    robber_not_bound_template: str = Field(default="您尚未绑定网站ID，无法打劫。", description="打劫者未绑定模板")
+    victim_not_bound_template: str = Field(default="对方尚未绑定网站ID，无法打劫。", description="目标未绑定模板")
+    invalid_quota_ratio_template: str = Field(default="打劫失败：额度展示比例配置无效。", description="比例无效模板")
+    balance_unavailable_template: str = Field(default="打劫失败：暂时无法读取双方余额。", description="余额不可读模板")
+    victim_balance_empty_template: str = Field(default="对方余额不足，无从下手！", description="目标余额不足模板")
+    api_update_failed_template: str = Field(default="打劫结算失败，请稍后再试。", description="结算失败模板")
+    rollback_failed_template: str = Field(default="打劫结算异常，资金状态未知，请联系管理员核查。", description="回滚失败模板")
+    cooldown_template: str = Field(default="打劫冷却中，请 {wait_seconds} 秒后再试。", description="冷却提示模板")
+    wanted_template: str = Field(default="您正在被通缉，请 {wait_seconds} 秒后再试。", description="通缉提示模板")
+    failed_template: str = Field(default="打劫失败！您赔付给对方 {display_amount:.2f} 额度，并被通缉 {wanted_seconds} 秒。", description="失败模板")
+    success_template: str = Field(default="打劫得手！\n获得 {display_amount:.2f} 额度！\n当前总额度为 {display_total:.2f}。", description="成功模板")
+    success_doubled_template: str = Field(default="打劫双倍得手！\n获得 {display_amount:.2f} 额度！\n当前总额度为 {display_total:.2f}。", description="双倍成功模板")
+    success_balance_unknown_template: str = Field(default="打劫得手！获得 {display_amount:.2f} 额度，但暂时无法读取最新余额。", description="成功但余额未知模板")
+    success_doubled_balance_unknown_template: str = Field(default="打劫双倍得手！获得 {display_amount:.2f} 额度，但暂时无法读取最新余额。", description="双倍成功但余额未知模板")
+    unexpected_status_template: str = Field(default="打劫处理异常: {status}", description="未知状态模板")
+    user_info_unavailable_template: str = Field(default="无法获取您的用户信息。", description="用户信息缺失模板")
+    invalid_target_template: str = Field(
+        default="格式错误，请使用 /打劫 @用户 或 /打劫 用户ID。", description="目标格式错误模板"
+    )
+
+
 class OptionalPmSettings(PluginConfigBase):
     __ui_label__ = "私聊高级开关"
     __ui_icon__ = "message-square"
-    __ui_order__ = 6
+    __ui_order__ = 7
 
     enable_all_pm: bool = Field(default=True, description="是否允许所有私聊指令")
 
@@ -89,6 +127,7 @@ class NewApiSuiteConfig(PluginConfigBase):
     permission: PermissionSettings = Field(default_factory=PermissionSettings)
     binding: BindingSettings = Field(default_factory=BindingSettings)
     check_in: CheckInSettings = Field(default_factory=CheckInSettings)
+    robbery: RobberySettings = Field(default_factory=RobberySettings)
     pm: OptionalPmSettings = Field(default_factory=OptionalPmSettings)
 
 
@@ -265,6 +304,53 @@ class NewApiSuitePlugin(MaiBotPlugin):
                 )
         return f"签到处理异常: {status}"
 
+    def _format_robbery_reply(self, status: str, details: Dict[str, Any]) -> str:
+        config = self.config.robbery
+        defaults = {
+            "DISABLED": "打劫功能暂未开启。",
+            "SELF_TARGET": "不能打劫自己哦！",
+            "ROBBER_NOT_BOUND": "您尚未绑定网站ID，无法打劫。",
+            "VICTIM_NOT_BOUND": "对方尚未绑定网站ID，无法打劫。",
+            "INVALID_QUOTA_RATIO": "打劫失败：额度展示比例配置无效。",
+            "BALANCE_UNAVAILABLE": "打劫失败：暂时无法读取双方余额。",
+            "VICTIM_BALANCE_EMPTY": "对方余额不足，无从下手！",
+            "API_UPDATE_FAILED": "打劫结算失败，请稍后再试。",
+            "ROLLBACK_FAILED": "打劫结算异常，资金状态未知，请联系管理员核查。",
+            "COOLDOWN": "打劫冷却中，请 {wait_seconds} 秒后再试。",
+            "WANTED": "您正在被通缉，请 {wait_seconds} 秒后再试。",
+            "FAILED": "打劫失败！您赔付给对方 {display_amount:.2f} 额度，并被通缉 {wanted_seconds} 秒。",
+            "SUCCESS": "打劫得手！\n获得 {display_amount:.2f} 额度！\n当前总额度为 {display_total:.2f}。",
+            "SUCCESS_DOUBLED": "打劫双倍得手！\n获得 {display_amount:.2f} 额度！\n当前总额度为 {display_total:.2f}。",
+            "SUCCESS_BALANCE_UNKNOWN": "打劫得手！获得 {display_amount:.2f} 额度，但暂时无法读取最新余额。",
+            "SUCCESS_DOUBLED_BALANCE_UNKNOWN": "打劫双倍得手！获得 {display_amount:.2f} 额度，但暂时无法读取最新余额。",
+            "UNEXPECTED": "打劫处理异常: {status}",
+        }
+        field_names = {
+            "SUCCESS_DOUBLED": "success_doubled_template",
+            "SUCCESS_DOUBLED_BALANCE_UNKNOWN": "success_doubled_balance_unknown_template",
+            "UNEXPECTED": "unexpected_status_template",
+        }
+        known_statuses = set(defaults) - {"UNEXPECTED"}
+        status_key = status if status in known_statuses else "UNEXPECTED"
+        field_names.setdefault(status_key, f"{status_key.lower()}_template")
+        message_template = getattr(
+            config, field_names[status_key], defaults.get(status_key, defaults["UNEXPECTED"])
+        )
+        if status in ("COOLDOWN", "WANTED"):
+            details = {**details, "wait_seconds": max(1, int(details.get("wait_seconds", 1)))}
+        elif status == "FAILED":
+            details = {**details, "wanted_seconds": config.wanted_seconds}
+        elif status in ("SUCCESS", "SUCCESS_BALANCE_UNKNOWN") and details.get("is_doubled"):
+            field_names_key = "SUCCESS_DOUBLED" if status == "SUCCESS" else "SUCCESS_DOUBLED_BALANCE_UNKNOWN"
+            message_template = getattr(config, field_names[field_names_key], defaults[field_names_key])
+        details = {**details, "status": status}
+        try:
+            return message_template.format(**details)
+        except (IndexError, KeyError, TypeError, ValueError) as error:
+            logger.warning("渲染打劫模板失败: %s", error)
+            fallback = defaults.get(status, defaults["UNEXPECTED"])
+            return fallback.format(**{**details, "wanted_seconds": config.wanted_seconds})
+
     async def _send_and_return(self, text: str, stream_id: str):
         if stream_id:
             await self.ctx.send.text(text, stream_id)
@@ -323,6 +409,21 @@ class NewApiSuitePlugin(MaiBotPlugin):
             return await self._send_and_return("无法获取您的用户信息。", stream_id)
         status, details = await self.core.perform_check_in(user_id)
         return await self._send_and_return(self._format_checkin_reply(status, details), stream_id)
+
+    @Command("打劫", pattern=r"^/打劫\s+.*$")
+    async def cmd_robbery(self, **kwargs: Any):
+        message = kwargs.get("message", {})
+        stream_id = self._extract_stream_id(kwargs, message)
+        if not self._permission_allowed(message):
+            return True, "", 0
+        robber_id = self._extract_user_id(message)
+        if robber_id is None:
+            return await self._send_and_return(self.config.robbery.user_info_unavailable_template, stream_id)
+        victim_id = self._resolve_identifier(message, kwargs.get("matched_groups", {}))
+        if victim_id is None:
+            return await self._send_and_return(self.config.robbery.invalid_target_template, stream_id)
+        status, details = await self.core.perform_robbery(robber_id, victim_id)
+        return await self._send_and_return(self._format_robbery_reply(status, details), stream_id)
 
     @Command("解绑", pattern=r"^/解绑(?:\s+(?P<identifier>\S+))?$")
     async def cmd_unbind(self, **kwargs: Any):

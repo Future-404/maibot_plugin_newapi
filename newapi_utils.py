@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Optional, Any, Dict, Tuple
+from uuid import uuid4
 
 logger = logging.getLogger("newapi_suite")
 
@@ -132,6 +133,15 @@ class NewApiCore:
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_newapi_bindings_website_user_id "
                 "ON newapi_bindings(website_user_id)"
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS newapi_robbery_states (
+                    qq_id INTEGER PRIMARY KEY,
+                    cooldown_until TEXT,
+                    wanted_until TEXT
+                )
+                """
+            )
             conn.commit()
 
     async def execute_query(self, query: str, params: Tuple = (), fetch: str = "none") -> Any:
@@ -233,8 +243,10 @@ class NewApiCore:
         ratio = self.plugin.config.binding.quota_display_ratio
         return ratio if ratio > 0 else None
 
-    async def add_api_user_quota(self, website_user_id: int, raw_amount: int) -> bool:
-        if raw_amount <= 0:
+    async def _change_api_user_quota_result(
+        self, website_user_id: int, raw_amount: int, mode: str
+    ) -> Optional[bool]:
+        if raw_amount <= 0 or mode not in ("add", "subtract"):
             return False
         response = await self.api_request(
             "POST",
@@ -242,11 +254,161 @@ class NewApiCore:
             {
                 "id": website_user_id,
                 "action": "add_quota",
-                "mode": "add",
+                "mode": mode,
                 "value": raw_amount,
             },
         )
-        return bool(response and response.get("success"))
+        if response is None:
+            return None
+        return bool(response.get("success"))
+
+    async def change_api_user_quota(self, website_user_id: int, raw_amount: int, mode: str) -> bool:
+        return (await self._change_api_user_quota_result(website_user_id, raw_amount, mode)) is True
+
+    async def add_api_user_quota(self, website_user_id: int, raw_amount: int) -> bool:
+        return await self.change_api_user_quota(website_user_id, raw_amount, "add")
+
+    async def _claim_robbery(self, qq_id: int) -> Tuple[str, Dict[str, Any]]:
+        now = datetime.utcnow()
+        token = f"pending:{uuid4()}"
+
+        def sync_op():
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+                row = cursor.execute(
+                    "SELECT cooldown_until, wanted_until FROM newapi_robbery_states WHERE qq_id = ?",
+                    (qq_id,),
+                ).fetchone()
+                raw_cooldown = row[0] if row else None
+                cooldown_until = self._parse_time(raw_cooldown)
+                wanted_until = self._parse_time(row[1]) if row else None
+                if isinstance(raw_cooldown, str) and raw_cooldown.startswith("pending:"):
+                    return "COOLDOWN", {"wait_seconds": 1}
+                if wanted_until and wanted_until > now:
+                    return "WANTED", {"wait_seconds": (wanted_until - now).total_seconds()}
+                if cooldown_until and cooldown_until > now:
+                    return "COOLDOWN", {"wait_seconds": (cooldown_until - now).total_seconds()}
+                cursor.execute(
+                    """
+                    INSERT INTO newapi_robbery_states (qq_id, cooldown_until, wanted_until)
+                    VALUES (?, ?, NULL)
+                    ON CONFLICT(qq_id) DO UPDATE SET cooldown_until = excluded.cooldown_until
+                    """,
+                    (qq_id, token),
+                )
+                conn.commit()
+                return "CLAIMED", {"token": token}
+
+        return await asyncio.to_thread(sync_op)
+
+    async def _release_robbery_claim(self, qq_id: int, token: str) -> None:
+        await self.execute_query(
+            "UPDATE newapi_robbery_states SET cooldown_until = NULL "
+            "WHERE qq_id = %s AND cooldown_until = %s",
+            (qq_id, token),
+        )
+
+    async def _finish_robbery_claim(
+        self, qq_id: int, token: str, cooldown_seconds: int = 0, wanted_seconds: int = 0
+    ) -> None:
+        now = datetime.utcnow()
+        cooldown_until = (now + timedelta(seconds=cooldown_seconds)).isoformat() if cooldown_seconds else None
+        wanted_until = (now + timedelta(seconds=wanted_seconds)).isoformat() if wanted_seconds else None
+        await self.execute_query(
+            "UPDATE newapi_robbery_states SET cooldown_until = %s, wanted_until = %s "
+            "WHERE qq_id = %s AND cooldown_until = %s",
+            (cooldown_until, wanted_until, qq_id, token),
+        )
+
+    async def _transfer_quota(
+        self, source_id: int, target_id: int, raw_amount: int
+    ) -> Tuple[bool, bool]:
+        source_result = await self._change_api_user_quota_result(source_id, raw_amount, "subtract")
+        if source_result is not True:
+            return False, source_result is None
+        target_result = await self._change_api_user_quota_result(target_id, raw_amount, "add")
+        if target_result is True:
+            return True, False
+        if target_result is None:
+            # 网络结果未知时不自动补偿，避免远端已入账后再次增发。
+            return False, True
+        rolled_back = await self._change_api_user_quota_result(source_id, raw_amount, "add")
+        return False, rolled_back is not True
+
+    async def perform_robbery(self, robber_qq_id: int, victim_qq_id: int) -> Tuple[str, Dict[str, Any]]:
+        config = self.plugin.config.robbery
+        if not config.enabled:
+            return "DISABLED", {}
+        if robber_qq_id == victim_qq_id:
+            return "SELF_TARGET", {}
+        ratio = self._quota_ratio()
+        if ratio is None:
+            return "INVALID_QUOTA_RATIO", {}
+        robber_binding = await self.get_user_by_qq(robber_qq_id)
+        if not robber_binding:
+            return "ROBBER_NOT_BOUND", {}
+        victim_binding = await self.get_user_by_qq(victim_qq_id)
+        if not victim_binding:
+            return "VICTIM_NOT_BOUND", {}
+
+        claim_status, claim_details = await self._claim_robbery(robber_qq_id)
+        if claim_status != "CLAIMED":
+            return claim_status, claim_details
+        token = claim_details["token"]
+        robber_profile = await self.get_api_user_data(robber_binding["website_user_id"])
+        victim_profile = await self.get_api_user_data(victim_binding["website_user_id"])
+        if not robber_profile or not victim_profile:
+            await self._release_robbery_claim(robber_qq_id, token)
+            return "BALANCE_UNAVAILABLE", {}
+
+        if random.random() < config.success_chance:
+            multiplier = 2 if random.random() < config.double_chance else 1
+            raw_amount = min(
+                int(config.base_display_quota * ratio) * multiplier,
+                max(0, int(victim_profile.get("quota", 0))),
+            )
+            if raw_amount <= 0:
+                await self._release_robbery_claim(robber_qq_id, token)
+                return "VICTIM_BALANCE_EMPTY", {}
+            transferred, rollback_failed = await self._transfer_quota(
+                victim_binding["website_user_id"], robber_binding["website_user_id"], raw_amount
+            )
+            if not transferred:
+                await self._release_robbery_claim(robber_qq_id, token)
+                if rollback_failed:
+                    logger.critical("打劫转账回滚失败：%s -> %s，额度 %s", victim_qq_id, robber_qq_id, raw_amount)
+                    return "ROLLBACK_FAILED", {}
+                return "API_UPDATE_FAILED", {}
+            await self._finish_robbery_claim(
+                robber_qq_id, token, cooldown_seconds=config.cooldown_seconds
+            )
+            details = {"display_amount": raw_amount / ratio, "is_doubled": multiplier == 2}
+            updated_robber = await self.get_api_user_data(robber_binding["website_user_id"])
+            if not updated_robber:
+                return "SUCCESS_BALANCE_UNKNOWN", details
+            details["display_total"] = updated_robber.get("quota", 0) / ratio
+            return "SUCCESS", details
+
+        penalty_cap = int(config.failure_penalty_max_display_quota * ratio)
+        raw_amount = int(max(0, int(robber_profile.get("quota", 0))) * config.failure_penalty_ratio)
+        if penalty_cap > 0:
+            raw_amount = min(raw_amount, penalty_cap)
+        raw_amount = min(raw_amount, max(0, int(robber_profile.get("quota", 0))))
+        if raw_amount > 0:
+            transferred, rollback_failed = await self._transfer_quota(
+                robber_binding["website_user_id"], victim_binding["website_user_id"], raw_amount
+            )
+            if not transferred:
+                await self._release_robbery_claim(robber_qq_id, token)
+                if rollback_failed:
+                    logger.critical("打劫失败赔付回滚失败：%s -> %s，额度 %s", robber_qq_id, victim_qq_id, raw_amount)
+                    return "ROLLBACK_FAILED", {}
+                return "API_UPDATE_FAILED", {}
+        await self._finish_robbery_claim(
+            robber_qq_id, token, wanted_seconds=config.wanted_seconds
+        )
+        return "FAILED", {"display_amount": raw_amount / ratio}
 
     async def perform_check_in(self, qq_id: int) -> Tuple[str, Dict[str, Any]]:
         check_in_conf = self.plugin.config.check_in

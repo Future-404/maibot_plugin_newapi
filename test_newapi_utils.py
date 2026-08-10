@@ -25,6 +25,16 @@ class FakePlugin:
                 first_check_in_bonus_enabled=False,
                 first_check_in_bonus_display_quota=0.0,
             ),
+            robbery=SimpleNamespace(
+                enabled=True,
+                success_chance=1.0,
+                double_chance=0.0,
+                base_display_quota=1.0,
+                cooldown_seconds=300,
+                failure_penalty_ratio=0.1,
+                failure_penalty_max_display_quota=10.0,
+                wanted_seconds=600,
+            ),
         )
 
 
@@ -132,12 +142,18 @@ class NewApiCoreTests(unittest.IsolatedAsyncioTestCase):
         legacy_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         legacy_db = os.path.join(legacy_dir.name, "newapi_data.db")
         import sqlite3
+
         with sqlite3.connect(legacy_db) as conn:
             conn.execute(
                 "CREATE TABLE newapi_bindings (id INTEGER PRIMARY KEY, qq_id INTEGER UNIQUE, website_user_id INTEGER NOT NULL)"
             )
         legacy_core = NewApiCore(FakePlugin(), legacy_dir.name)
         self.assertTrue(await legacy_core.initialize())
+        with sqlite3.connect(legacy_db) as conn:
+            robbery_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(newapi_robbery_states)")
+            }
+        self.assertEqual(robbery_columns, {"qq_id", "cooldown_until", "wanted_until"})
         await legacy_core.execute_query(
             "INSERT INTO newapi_bindings (qq_id, website_user_id) VALUES (%s, %s)", (3001, 4001)
         )
@@ -174,6 +190,95 @@ class NewApiCoreTests(unittest.IsolatedAsyncioTestCase):
         self.core.update_api_user = fake_update
         self.assertTrue(await self.core.revert_user_group(2001))
         self.assertEqual(captured["group"], "default")
+
+    async def test_robbery_success_transfers_to_robber(self):
+        self.assertTrue(await self.core.insert_binding(1002, 2002))
+        calls = []
+
+        async def fake_request(method, endpoint, json_data=None):
+            if endpoint == "/api/user/manage":
+                calls.append(json_data)
+                return {"success": True}
+            if endpoint == "/api/user/2001":
+                return {"success": True, "data": {"quota": 1500000}}
+            if endpoint == "/api/user/2002":
+                return {"success": True, "data": {"quota": 5000000}}
+            self.fail(endpoint)
+
+        self.core.api_request = fake_request
+        status, details = await self.core.perform_robbery(1001, 1002)
+        self.assertEqual(status, "SUCCESS")
+        self.assertEqual(details["display_amount"], 1.0)
+        self.assertEqual(calls[0], {"id": 2002, "action": "add_quota", "mode": "subtract", "value": 500000})
+        self.assertEqual(calls[1], {"id": 2001, "action": "add_quota", "mode": "add", "value": 500000})
+
+    async def test_robbery_failure_pays_victim_and_wanted(self):
+        self.core.plugin.config.robbery.success_chance = 0.0
+        self.assertTrue(await self.core.insert_binding(1002, 2002))
+        calls = []
+
+        async def fake_request(method, endpoint, json_data=None):
+            if endpoint in ("/api/user/2001", "/api/user/2002"):
+                return {"success": True, "data": {"quota": 5000000}}
+            calls.append(json_data)
+            return {"success": True}
+
+        self.core.api_request = fake_request
+        status, details = await self.core.perform_robbery(1001, 1002)
+        self.assertEqual(status, "FAILED")
+        self.assertGreater(details["display_amount"], 0)
+        self.assertEqual(calls[0]["mode"], "subtract")
+        self.assertEqual(calls[1]["mode"], "add")
+        wanted, _ = await self.core._claim_robbery(1001)
+        self.assertEqual(wanted, "WANTED")
+
+    async def test_robbery_self_and_cooldown_rejected(self):
+        self.assertEqual((await self.core.perform_robbery(1001, 1001))[0], "SELF_TARGET")
+        self.assertTrue(await self.core.insert_binding(1002, 2002))
+
+        async def fake_request(method, endpoint, json_data=None):
+            if endpoint.startswith("/api/user/"):
+                return {"success": True, "data": {"quota": 5000000}}
+            return {"success": True}
+
+        self.core.api_request = fake_request
+        self.assertEqual((await self.core.perform_robbery(1001, 1002))[0], "SUCCESS")
+        self.assertEqual((await self.core.perform_robbery(1001, 1002))[0], "COOLDOWN")
+
+    async def test_robbery_add_failure_rolls_back_deduction(self):
+        self.assertTrue(await self.core.insert_binding(1002, 2002))
+        calls = []
+
+        async def fake_request(method, endpoint, json_data=None):
+            if endpoint == "/api/user/2001":
+                return {"success": True, "data": {"quota": 5000000}}
+            if endpoint == "/api/user/2002":
+                return {"success": True, "data": {"quota": 5000000}}
+            if endpoint == "/api/user/manage":
+                calls.append(json_data)
+                return {"success": len(calls) != 2}
+            self.fail(endpoint)
+
+        self.core.api_request = fake_request
+        status, _ = await self.core.perform_robbery(1001, 1002)
+        self.assertEqual(status, "API_UPDATE_FAILED")
+        self.assertEqual(calls[2]["mode"], "add")
+
+    async def test_robbery_unknown_add_result_does_not_roll_back(self):
+        self.assertTrue(await self.core.insert_binding(1002, 2002))
+        calls = []
+
+        async def fake_request(method, endpoint, json_data=None):
+            if endpoint in ("/api/user/2001", "/api/user/2002"):
+                return {"success": True, "data": {"quota": 5000000}}
+            calls.append(json_data)
+            return {"success": True} if len(calls) == 1 else None
+
+        self.core.api_request = fake_request
+        status, _ = await self.core.perform_robbery(1001, 1002)
+        self.assertEqual(status, "ROLLBACK_FAILED")
+        self.assertEqual(len(calls), 2)
+
 
 
 if __name__ == "__main__":
