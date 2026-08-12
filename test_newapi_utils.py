@@ -37,6 +37,17 @@ class FakePlugin:
                 failure_penalty_max_display_quota=10.0,
                 wanted_seconds=600,
             ),
+            email=SimpleNamespace(
+                enabled=True,
+                smtp_host="smtp.test",
+                smtp_port=465,
+                smtp_user="sender@test",
+                smtp_password="secret",
+                ignore_ssl=True,
+                code_ttl_seconds=300,
+                mail_subject_template="绑定验证码",
+                mail_body_template="您的绑定验证码是 {code}，请在 {ttl_seconds} 秒内使用 /绑定验证 <验证码> 完成绑定。",
+            ),
         )
 
 
@@ -325,6 +336,155 @@ class NewApiCoreTests(unittest.IsolatedAsyncioTestCase):
         status, _ = await self.core.perform_robbery(1001, 1002)
         self.assertEqual(status, "ROLLBACK_FAILED")
         self.assertEqual(len(calls), 2)
+
+    async def test_binding_verification_roundtrip(self):
+        self.assertTrue(await self.core.set_binding_verification(1001, 2001, "123456", 300))
+        record = await self.core.get_binding_verification(1001)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["qq_id"], 1001)
+        self.assertEqual(record["website_user_id"], 2001)
+        self.assertEqual(record["code"], "123456")
+        self.assertIsNotNone(record["expires_at"])
+
+    async def test_binding_verification_overwrite(self):
+        await self.core.set_binding_verification(1001, 2001, "111111", 300)
+        await self.core.set_binding_verification(1001, 2002, "222222", 300)
+        import sqlite3
+
+        with sqlite3.connect(self.core.db_path) as conn:
+            rows = conn.execute(
+                "SELECT code, website_user_id FROM newapi_binding_verifications WHERE qq_id = ?",
+                (1001,),
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "222222")
+        self.assertEqual(rows[0][1], 2002)
+
+    async def test_verify_binding_code_success(self):
+        await self.core.set_binding_verification(1001, 2001, "123456", 300)
+        status, details = await self.core.verify_binding_code(1001, "123456")
+        self.assertEqual(status, "SUCCESS")
+        self.assertEqual(details, {"website_user_id": 2001})
+
+    async def test_verify_binding_code_wrong(self):
+        await self.core.set_binding_verification(1001, 2001, "123456", 300)
+        status, _ = await self.core.verify_binding_code(1001, "000000")
+        self.assertEqual(status, "INVALID")
+
+    async def test_verify_binding_code_not_found(self):
+        status, _ = await self.core.verify_binding_code(9999, "123456")
+        self.assertEqual(status, "NOT_FOUND")
+
+    async def test_verify_binding_code_expired(self):
+        await self.core.set_binding_verification(1001, 2001, "123456", 300)
+        import sqlite3
+
+        with sqlite3.connect(self.core.db_path) as conn:
+            conn.execute(
+                "UPDATE newapi_binding_verifications SET expires_at = ? WHERE qq_id = ?",
+                ("2000-01-01T00:00:00", 1001),
+            )
+        status, _ = await self.core.verify_binding_code(1001, "123456")
+        self.assertEqual(status, "EXPIRED")
+
+    async def test_verify_binding_code_expired_clears_record(self):
+        await self.core.set_binding_verification(1001, 2001, "123456", 300)
+        import sqlite3
+
+        with sqlite3.connect(self.core.db_path) as conn:
+            conn.execute(
+                "UPDATE newapi_binding_verifications SET expires_at = ? WHERE qq_id = ?",
+                ("not-a-date", 1001),
+            )
+        status, _ = await self.core.verify_binding_code(1001, "123456")
+        self.assertEqual(status, "EXPIRED")
+        self.assertIsNone(await self.core.get_binding_verification(1001))
+
+    async def test_verify_binding_code_locked_after_attempts(self):
+        await self.core.set_binding_verification(1001, 2001, "123456", 300)
+        for _ in range(4):
+            status, _ = await self.core.verify_binding_code(1001, "000000")
+            self.assertEqual(status, "INVALID")
+        status, _ = await self.core.verify_binding_code(1001, "000000")
+        self.assertEqual(status, "LOCKED")
+        self.assertIsNone(await self.core.get_binding_verification(1001))
+
+    async def test_generate_code_format(self):
+        codes = [NewApiCore.generate_code() for _ in range(20)]
+        self.assertEqual(len(set(codes)), 20)
+        for code in codes:
+            self.assertTrue(code.isdigit())
+            self.assertEqual(len(code), 6)
+
+    async def test_send_verification_email_requires_config(self):
+        self.core.plugin.config.email.smtp_host = ""
+        sent, error = await self.core.send_verification_email("user@test", "123456", 300)
+        self.assertFalse(sent)
+        self.assertIn("SMTP", error)
+
+    async def test_send_verification_email_success(self):
+        from unittest import mock
+
+        context_obj = object()
+        with mock.patch("smtplib.SMTP_SSL") as mock_smtp, mock.patch(
+            "ssl._create_unverified_context", return_value=context_obj
+        ):
+            server = mock_smtp.return_value.__enter__.return_value
+            sent, error = await self.core.send_verification_email("user@test", "123456", 300)
+        self.assertTrue(sent, error)
+        mock_smtp.assert_called_once_with("smtp.test", 465, context=context_obj, timeout=10)
+        server.login.assert_called_once_with("sender@test", "secret")
+        self.assertTrue(server.send_message.called)
+        message = server.send_message.call_args[0][0]
+        self.assertEqual(message["To"], "user@test")
+        self.assertEqual(message["From"], "sender@test")
+        self.assertEqual(message["Subject"], "绑定验证码")
+        self.assertIn("123456", message.get_content())
+        self.assertIn("300", message.get_content())
+
+    async def test_send_verification_email_ignore_ssl_context(self):
+        from unittest import mock
+
+        unverified = object()
+        default = object()
+        with mock.patch("ssl._create_unverified_context", return_value=unverified) as mock_unverified, \
+                mock.patch("ssl.create_default_context", return_value=default) as mock_default, \
+                mock.patch("smtplib.SMTP_SSL") as mock_smtp:
+            await self.core.send_verification_email("user@test", "123456", 300)
+            mock_unverified.assert_called_once_with()
+            mock_default.assert_not_called()
+            mock_smtp.assert_called_once()
+            self.assertIs(mock_smtp.call_args.kwargs["context"], unverified)
+        self.core.plugin.config.email.ignore_ssl = False
+        with mock.patch("ssl._create_unverified_context") as mock_unverified, \
+                mock.patch("ssl.create_default_context", return_value=default) as mock_default, \
+                mock.patch("smtplib.SMTP_SSL") as mock_smtp:
+            await self.core.send_verification_email("user@test", "123456", 300)
+            mock_unverified.assert_not_called()
+            mock_default.assert_called_once_with()
+            mock_smtp.assert_called_once()
+            self.assertIs(mock_smtp.call_args.kwargs["context"], default)
+
+    async def test_legacy_database_gains_verification_table(self):
+        legacy_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        legacy_db = os.path.join(legacy_dir.name, "newapi_data.db")
+        import sqlite3
+
+        with sqlite3.connect(legacy_db) as conn:
+            conn.execute(
+                "CREATE TABLE newapi_bindings (id INTEGER PRIMARY KEY, qq_id INTEGER UNIQUE, website_user_id INTEGER NOT NULL)"
+            )
+        legacy_core = NewApiCore(FakePlugin(), legacy_dir.name)
+        self.assertTrue(await legacy_core.initialize())
+        with sqlite3.connect(legacy_db) as conn:
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(newapi_binding_verifications)")
+            }
+        self.assertEqual(
+            columns,
+            {"qq_id", "website_user_id", "code", "expires_at", "attempts", "created_at"},
+        )
+        legacy_dir.cleanup()
 
 
 
