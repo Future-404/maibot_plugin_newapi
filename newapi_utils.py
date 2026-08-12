@@ -1,11 +1,15 @@
 import os
 import asyncio
 import httpx
+import smtplib
+import ssl
 import sqlite3
 import random
+import secrets
 import logging
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from email.message import EmailMessage
 from typing import Optional, Any, Dict, Tuple
 from uuid import uuid4
 
@@ -145,6 +149,26 @@ class NewApiCore:
                 )
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS newapi_binding_verifications (
+                    qq_id INTEGER PRIMARY KEY,
+                    website_user_id INTEGER NOT NULL,
+                    code TEXT NOT NULL,
+                    expires_at TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            verification_columns = {
+                row[1]
+                for row in cursor.execute("PRAGMA table_info(newapi_binding_verifications)").fetchall()
+            }
+            if "attempts" not in verification_columns:
+                cursor.execute(
+                    "ALTER TABLE newapi_binding_verifications ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+                )
             conn.commit()
 
     async def execute_query(self, query: str, params: Tuple = (), fetch: str = "none") -> Any:
@@ -567,3 +591,135 @@ class NewApiCore:
             "website_user_id": website_user_id,
             "new_display_quota": user_data.get("quota", 0) / ratio,
         }
+
+    @staticmethod
+    def generate_code(length: int = 6) -> str:
+        """生成 length 位纯数字验证码（密码学安全随机）。"""
+        return f"{secrets.randbelow(10**length):0{length}d}"
+
+    async def set_binding_verification(
+        self, qq_id: int, website_user_id: int, code: str, ttl_seconds: int
+    ) -> bool:
+        """写入（或覆盖）该用户的邮箱绑定待验证记录，过期时间为 now + ttl_seconds。"""
+        expires_at = (datetime.utcnow() + timedelta(seconds=ttl_seconds)).isoformat()
+
+        def sync_op() -> bool:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("BEGIN IMMEDIATE")
+                    cursor.execute(
+                        """
+                        INSERT INTO newapi_binding_verifications
+                            (qq_id, website_user_id, code, expires_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(qq_id) DO UPDATE SET
+                            website_user_id = excluded.website_user_id,
+                            code = excluded.code,
+                            expires_at = excluded.expires_at,
+                            created_at = CURRENT_TIMESTAMP
+                        """,
+                        (qq_id, website_user_id, code, expires_at),
+                    )
+                    conn.commit()
+                return True
+            except sqlite3.Error as error:
+                logger.error("[NewAPI Utils] 写入绑定验证码失败: %s", error)
+                return False
+
+        return await asyncio.to_thread(sync_op)
+
+    async def get_binding_verification(self, qq_id: int) -> Optional[Dict]:
+        """读取该用户的待验证绑定记录，expires_at 解析为 datetime。"""
+        result = await self.execute_query(
+            "SELECT * FROM newapi_binding_verifications WHERE qq_id = %s",
+            (qq_id,),
+            fetch="one",
+        )
+        if result and result.get("expires_at"):
+            parsed = self._parse_time(result["expires_at"])
+            if parsed:
+                result["expires_at"] = parsed
+        return result
+
+    async def verify_binding_code(self, qq_id: int, code: str) -> Tuple[str, Optional[Dict]]:
+        """校验绑定验证码。错误尝试会累计，达到上限后删除记录（需重新申请）。返回状态与通过时的 details。"""
+        record = await self.get_binding_verification(qq_id)
+        if not record:
+            return "NOT_FOUND", None
+        expires_at = record.get("expires_at")
+        if not isinstance(expires_at, datetime) or expires_at < datetime.utcnow():
+            await self.clear_binding_verification(qq_id)
+            return "EXPIRED", None
+        if record.get("code") != code:
+            attempts = int(record.get("attempts") or 0) + 1
+            if attempts >= 5:
+                await self.clear_binding_verification(qq_id)
+                return "LOCKED", None
+            await self.execute_query(
+                "UPDATE newapi_binding_verifications SET attempts = %s WHERE qq_id = %s",
+                (attempts, qq_id),
+            )
+            return "INVALID", None
+        return "SUCCESS", {"website_user_id": record["website_user_id"]}
+
+    async def clear_binding_verification(self, qq_id: int) -> int:
+        """删除该用户的待验证绑定记录，绑定成功后调用。返回删除行数。"""
+        return await self.execute_query(
+            "DELETE FROM newapi_binding_verifications WHERE qq_id = %s", (qq_id,)
+        )
+
+    async def send_verification_email(
+        self, to: str, code: str, ttl_seconds: int
+    ) -> Tuple[bool, str]:
+        """发送绑定验证码邮件（在后台线程执行，避免阻塞事件循环）。返回 (是否成功, 错误信息)。"""
+        return await asyncio.to_thread(
+            self._send_verification_email_sync, to, code, ttl_seconds
+        )
+
+    def _send_verification_email_sync(
+        self, to: str, code: str, ttl_seconds: int
+    ) -> Tuple[bool, str]:
+        config = self.plugin.config.email
+        smtp_host = str(getattr(config, "smtp_host", "") or "").strip()
+        smtp_port = int(getattr(config, "smtp_port", 465) or 465)
+        smtp_user = str(getattr(config, "smtp_user", "") or "").strip()
+        smtp_password = str(getattr(config, "smtp_password", "") or "")
+        if not smtp_host or not smtp_user or not smtp_password:
+            return False, "SMTP 未配置"
+
+        try:
+            subject = str(getattr(config, "mail_subject_template", "") or "").format(
+                code=code, ttl_seconds=ttl_seconds
+            )
+        except (KeyError, ValueError, IndexError) as error:
+            logger.warning("[NewAPI Utils] 渲染邮件主题模板失败: %s", error)
+            subject = "绑定验证码"
+        try:
+            body = str(getattr(config, "mail_body_template", "") or "").format(
+                code=code, ttl_seconds=ttl_seconds
+            )
+        except (KeyError, ValueError, IndexError) as error:
+            logger.warning("[NewAPI Utils] 渲染邮件正文模板失败: %s", error)
+            body = f"您的绑定验证码是 {code}，请在 {ttl_seconds} 秒内使用 /绑定验证 <验证码> 完成绑定。"
+
+        message = EmailMessage()
+        message["From"] = smtp_user
+        message["To"] = to
+        message["Subject"] = subject
+        message.set_content(body)
+
+        if getattr(config, "ignore_ssl", True):
+            context = ssl._create_unverified_context()
+        else:
+            context = ssl.create_default_context()
+        try:
+            with smtplib.SMTP_SSL(
+                smtp_host, smtp_port, context=context, timeout=10
+            ) as server:
+                server.login(smtp_user, smtp_password)
+                server.send_message(message)
+            return True, ""
+        except Exception as error:
+            logger.error("[NewAPI Utils] 发送绑定验证邮件失败: %s", error)
+            return False, str(error)

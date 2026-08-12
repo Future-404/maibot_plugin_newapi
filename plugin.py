@@ -16,7 +16,7 @@ class PluginSection(PluginConfigBase):
     __ui_order__ = 1
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="2.3.1", description="配置规范版本")
+    config_version: str = Field(default="2.5.0", description="配置规范版本")
 
 
 class ApiSettings(PluginConfigBase):
@@ -111,7 +111,7 @@ class RobberySettings(PluginConfigBase):
     unexpected_status_template: str = Field(default="打劫处理异常: {status}", description="未知状态模板")
     user_info_unavailable_template: str = Field(default="无法获取您的用户信息。", description="用户信息缺失模板")
     invalid_target_template: str = Field(
-        default="格式错误，请使用 /打劫 @用户 或 /打劫 用户ID。", description="目标格式错误模板"
+        default="格式错误，请使用 /打劫 @用户名 或 /打劫 用户ID。", description="目标格式错误模板"
     )
 
 
@@ -123,6 +123,33 @@ class OptionalPmSettings(PluginConfigBase):
     enable_all_pm: bool = Field(default=True, description="是否允许所有私聊指令")
 
 
+class EmailSettings(PluginConfigBase):
+    __ui_label__ = "邮箱验证绑定"
+    __ui_icon__ = "mail"
+    __ui_order__ = 8
+
+    enabled: bool = Field(
+        default=True,
+        description="是否启用邮箱验证绑定；设为 false 时 /绑定 回退为旧版一次性绑定",
+    )
+    smtp_host: str = Field(default="", description="SMTP 服务器地址（如 smtp.qq.com），必填")
+    smtp_port: int = Field(default=465, description="SMTP 端口（默认 465，走 SMTP_SSL）")
+    smtp_user: str = Field(default="", description="SMTP 登录账号（发件邮箱）")
+    smtp_password: str = Field(default="", description="SMTP 授权码/密码")
+    ignore_ssl: bool = Field(
+        default=True, description="是否忽略 SSL 证书校验（自签名证书环境开启）"
+    )
+    code_ttl_seconds: int = Field(default=300, ge=0, description="验证码有效期（秒）")
+    mail_subject_template: str = Field(
+        default="绑定验证码",
+        description="邮件主题模板，可用变量 {code}、{ttl_seconds}",
+    )
+    mail_body_template: str = Field(
+        default="您的绑定验证码是 {code}，请在 {ttl_seconds} 秒内使用 /绑定验证 <验证码> 完成绑定。",
+        description="邮件正文模板，可用变量 {code}、{ttl_seconds}",
+    )
+
+
 class NewApiSuiteConfig(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     api: ApiSettings = Field(default_factory=ApiSettings)
@@ -131,6 +158,7 @@ class NewApiSuiteConfig(PluginConfigBase):
     check_in: CheckInSettings = Field(default_factory=CheckInSettings)
     robbery: RobberySettings = Field(default_factory=RobberySettings)
     pm: OptionalPmSettings = Field(default_factory=OptionalPmSettings)
+    email: EmailSettings = Field(default_factory=EmailSettings)
 
 
 class NewApiSuitePlugin(MaiBotPlugin):
@@ -436,7 +464,70 @@ class NewApiSuitePlugin(MaiBotPlugin):
         )
         if error_message:
             return await self._send_and_return(error_message, stream_id)
-        _, text = await self._perform_binding_ritual(user_id, website_user_id, self._extract_username(message))
+        if not self.config.email.enabled:
+            # 未启用邮箱验证时回退旧版一次性绑定，便于未配置 SMTP 的存量部署。
+            _, text = await self._perform_binding_ritual(
+                user_id, website_user_id, self._extract_username(message)
+            )
+            return await self._send_and_return(text, stream_id)
+        profile = await self.core.get_api_user_data(website_user_id)
+        email_address = (profile or {}).get("email")
+        if not email_address or not str(email_address).strip():
+            return await self._send_and_return(
+                "该网站用户未配置邮箱，无法验证身份，请联系管理员。", stream_id
+            )
+        code = NewApiCore.generate_code()
+        ttl_seconds = self.config.email.code_ttl_seconds
+        if not await self.core.set_binding_verification(
+            user_id, website_user_id, code, ttl_seconds
+        ):
+            return await self._send_and_return("验证码生成失败，请稍后再试。", stream_id)
+        sent, error = await self.core.send_verification_email(
+            str(email_address).strip(), code, ttl_seconds
+        )
+        if not sent:
+            await self.core.clear_binding_verification(user_id)
+            logger.error("[NewAPI Plugin] 发送绑定验证邮件失败: %s", error)
+            return await self._send_and_return(
+                f"验证码发送失败（{error}），请联系管理员检查 SMTP 配置。", stream_id
+            )
+        return await self._send_and_return(
+            f"验证码已发送，请查看邮箱（注意垃圾邮件箱），用 /绑定验证 <验证码> 完成绑定。"
+            f"验证码 {ttl_seconds} 秒内有效。",
+            stream_id,
+        )
+
+    @Command("绑定验证", pattern=r"^/绑定验证\s+(?P<code>\d{6})$")
+    async def cmd_bind_verify(self, **kwargs: Any):
+        message = kwargs.get("message", {})
+        stream_id = self._extract_stream_id(kwargs, message)
+        if not self._permission_allowed(message):
+            return True, "", 0
+        user_id = self._extract_user_id(message)
+        if user_id is None:
+            return await self._send_and_return("无法获取您的用户信息。", stream_id)
+        code = kwargs.get("matched_groups", {}).get("code", "")
+        status, details = await self.core.verify_binding_code(user_id, code)
+        if status == "NOT_FOUND":
+            return await self._send_and_return(
+                "请先使用 /绑定 <网站ID> 发起绑定申请。", stream_id
+            )
+        if status == "INVALID":
+            return await self._send_and_return("验证码错误，请检查后重试。", stream_id)
+        if status == "LOCKED":
+            return await self._send_and_return(
+                "验证码错误次数过多，已失效，请重新使用 /绑定 <网站ID> 获取新验证码。", stream_id
+            )
+        if status == "EXPIRED":
+            return await self._send_and_return(
+                "验证码已过期，请重新使用 /绑定 <网站ID> 获取新验证码。", stream_id
+            )
+        website_user_id = details["website_user_id"]
+        success, text = await self._perform_binding_ritual(
+            user_id, website_user_id, self._extract_username(message)
+        )
+        if success:
+            await self.core.clear_binding_verification(user_id)
         return await self._send_and_return(text, stream_id)
 
     @Command("签到", pattern=r"^/签到$")
