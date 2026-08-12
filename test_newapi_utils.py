@@ -165,6 +165,28 @@ class NewApiCoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_website_user_id_is_unique(self):
         self.assertFalse(await self.core.insert_binding(1002, 2001))
 
+    async def test_binding_saves_and_looks_up_username(self):
+        self.assertTrue(await self.core.insert_binding(1003, 2003, "alice"))
+        binding = await self.core.get_user_by_username("alice")
+        self.assertIsNotNone(binding)
+        self.assertEqual(binding["qq_id"], 1003)
+        self.assertEqual(binding["website_user_id"], 2003)
+        self.assertIsNone(await self.core.get_user_by_username("nobody"))
+
+    async def test_legacy_database_gains_username_column(self):
+        legacy_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        legacy_db = os.path.join(legacy_dir.name, "newapi_data.db")
+        import sqlite3
+        with sqlite3.connect(legacy_db) as conn:
+            conn.execute(
+                "CREATE TABLE newapi_bindings (id INTEGER PRIMARY KEY, qq_id INTEGER UNIQUE, website_user_id INTEGER NOT NULL)"
+            )
+        legacy_core = NewApiCore(FakePlugin(), legacy_dir.name)
+        self.assertTrue(await legacy_core.initialize())
+        self.assertTrue(await legacy_core.insert_binding(3002, 4002, "bob"))
+        self.assertIsNotNone(await legacy_core.get_user_by_username("bob"))
+        legacy_dir.cleanup()
+
     async def test_unbind_keeps_binding_when_remote_update_fails(self):
         async def fake_get(_):
             return {"id": 2001, "group": "vip"}

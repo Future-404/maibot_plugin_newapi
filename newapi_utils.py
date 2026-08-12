@@ -111,7 +111,8 @@ class NewApiCore:
                     qq_id INTEGER UNIQUE NOT NULL,
                     website_user_id INTEGER NOT NULL,
                     binding_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_check_in_time TIMESTAMP
+                    last_check_in_time TIMESTAMP,
+                    qq_username TEXT
                 )
                 """
             )
@@ -120,6 +121,8 @@ class NewApiCore:
             }
             if "last_check_in_time" not in columns:
                 cursor.execute("ALTER TABLE newapi_bindings ADD COLUMN last_check_in_time TIMESTAMP")
+            if "qq_username" not in columns:
+                cursor.execute("ALTER TABLE newapi_bindings ADD COLUMN qq_username TEXT")
             duplicates = cursor.execute(
                 """
                 SELECT website_user_id FROM newapi_bindings
@@ -485,6 +488,11 @@ class NewApiCore:
             fetch="one",
         )
 
+    async def get_user_by_username(self, username: str) -> Optional[Dict]:
+        return await self.execute_query(
+            "SELECT * FROM newapi_bindings WHERE qq_username = %s", (username,), fetch="one"
+        )
+
     async def get_api_user_data(self, user_id: int) -> Optional[Dict]:
         response = await self.api_request("GET", f"/api/user/{user_id}")
         return response.get("data") if response and response.get("success") else None
@@ -493,13 +501,13 @@ class NewApiCore:
         response = await self.api_request("PUT", "/api/user/", user_profile)
         return bool(response and response.get("success"))
 
-    async def insert_binding(self, qq_id: int, website_user_id: int) -> bool:
+    async def insert_binding(self, qq_id: int, website_user_id: int, qq_username: Optional[str] = None) -> bool:
         def sync_op():
             try:
                 with sqlite3.connect(self.db_path) as conn:
                     conn.execute(
-                        "INSERT INTO newapi_bindings (qq_id, website_user_id) VALUES (?, ?)",
-                        (qq_id, website_user_id),
+                        "INSERT INTO newapi_bindings (qq_id, website_user_id, qq_username) VALUES (?, ?, ?)",
+                        (qq_id, website_user_id, qq_username),
                     )
                 return True
             except sqlite3.IntegrityError:

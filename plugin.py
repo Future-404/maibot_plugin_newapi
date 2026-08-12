@@ -263,16 +263,6 @@ class NewApiSuitePlugin(MaiBotPlugin):
             return int(match.group(1) or match.group(2))
         return None
 
-    def _resolve_identifier(self, message: Dict[str, Any], matched: Dict[str, Any]) -> Optional[int]:
-        mention = self._extract_mention(message)
-        if mention is not None:
-            return mention
-        value = matched.get("identifier")
-        try:
-            return int(value) if value and str(value).isdigit() else None
-        except (TypeError, ValueError):
-            return None
-
     async def _check_self_binding(self, user_id: int) -> Optional[str]:
         existing = await self.core.get_user_by_qq(user_id)
         if existing:
@@ -289,7 +279,7 @@ class NewApiSuitePlugin(MaiBotPlugin):
             return f"网站ID {website_user_id} 已被其他用户绑定。"
         return None
 
-    async def _perform_binding_ritual(self, user_id: int, website_user_id: int) -> Tuple[bool, str]:
+    async def _perform_binding_ritual(self, user_id: int, website_user_id: int, username: Optional[str] = None) -> Tuple[bool, str]:
         profile = await self.core.get_api_user_data(website_user_id)
         if not profile:
             return False, "绑定失败，无法获取账户信息。"
@@ -298,13 +288,29 @@ class NewApiSuitePlugin(MaiBotPlugin):
         profile["group"] = target_group
         if not await self.core.update_api_user(profile):
             return False, "绑定失败，无法更新网站账户分组。"
-        if await self.core.insert_binding(user_id, website_user_id):
+        if await self.core.insert_binding(user_id, website_user_id, username):
             return True, f"绑定成功！\n网站ID: {website_user_id}\n专属分组: {target_group}"
         if not await self.core.get_user_by_website_id(website_user_id):
             profile["group"] = previous_group
             if not await self.core.update_api_user(profile):
                 logger.error("绑定本地记录失败后无法恢复网站用户 %s 的原分组", website_user_id)
         return False, "绑定失败：该用户或网站ID已被绑定。"
+
+    async def _resolve_target(self, message: Dict[str, Any], matched: Dict[str, Any]) -> Optional[int]:
+        mention = self._extract_mention(message)
+        if mention is not None:
+            return mention
+        value = matched.get("identifier")
+        try:
+            if value is not None and str(value).isdigit():
+                return int(value)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(value, str) and value.startswith("@"):
+            binding = await self.core.get_user_by_username(value[1:])
+            if binding:
+                return binding["qq_id"]
+        return None
 
     def _format_checkin_reply(self, status: str, details: Dict[str, Any]) -> str:
         if status == "NOT_BOUND":
@@ -430,7 +436,7 @@ class NewApiSuitePlugin(MaiBotPlugin):
         )
         if error_message:
             return await self._send_and_return(error_message, stream_id)
-        _, text = await self._perform_binding_ritual(user_id, website_user_id)
+        _, text = await self._perform_binding_ritual(user_id, website_user_id, self._extract_username(message))
         return await self._send_and_return(text, stream_id)
 
     @Command("签到", pattern=r"^/签到$")
@@ -445,7 +451,7 @@ class NewApiSuitePlugin(MaiBotPlugin):
         status, details = await self.core.perform_check_in(user_id)
         return await self._send_and_return(self._format_checkin_reply(status, details), stream_id)
 
-    @Command("打劫", pattern=r"^/打劫\s+.*$")
+    @Command("打劫", pattern=r"^/打劫\s+(?P<identifier>\S+)$")
     async def cmd_robbery(self, **kwargs: Any):
         message = kwargs.get("message", {})
         stream_id = self._extract_stream_id(kwargs, message)
@@ -454,7 +460,7 @@ class NewApiSuitePlugin(MaiBotPlugin):
         robber_id = self._extract_user_id(message)
         if robber_id is None:
             return await self._send_and_return(self.config.robbery.user_info_unavailable_template, stream_id)
-        victim_id = self._resolve_identifier(message, kwargs.get("matched_groups", {}))
+        victim_id = await self._resolve_target(message, kwargs.get("matched_groups", {}))
         if victim_id is None:
             return await self._send_and_return(self.config.robbery.invalid_target_template, stream_id)
         status, details = await self.core.perform_robbery(robber_id, victim_id)
@@ -468,7 +474,7 @@ class NewApiSuitePlugin(MaiBotPlugin):
             return True, "", 0
         if not self._is_admin(self._extract_username(message)):
             return await self._send_and_return("权限不足。", stream_id)
-        identifier = self._resolve_identifier(message, kwargs.get("matched_groups", {}))
+        identifier = await self._resolve_target(message, kwargs.get("matched_groups", {}))
         if identifier is None:
             return await self._send_and_return("格式错误。", stream_id)
         binding = await self.core.lookup_binding(identifier)
@@ -485,7 +491,7 @@ class NewApiSuitePlugin(MaiBotPlugin):
             return True, "", 0
         if not self._is_admin(self._extract_username(message)):
             return await self._send_and_return("权限不足。", stream_id)
-        identifier = self._resolve_identifier(message, kwargs.get("matched_groups", {}))
+        identifier = await self._resolve_target(message, kwargs.get("matched_groups", {}))
         if identifier is None:
             return await self._send_and_return("格式错误。", stream_id)
         binding = await self.core.lookup_binding(identifier)
@@ -505,7 +511,7 @@ class NewApiSuitePlugin(MaiBotPlugin):
         if not self._is_admin(self._extract_username(message)):
             return await self._send_and_return("权限不足。", stream_id)
         matched = kwargs.get("matched_groups", {})
-        identifier = self._resolve_identifier(message, matched)
+        identifier = await self._resolve_target(message, matched)
         if identifier is None:
             return await self._send_and_return("格式错误。", stream_id)
         status, details = await self.core.adjust_balance_by_identifier(

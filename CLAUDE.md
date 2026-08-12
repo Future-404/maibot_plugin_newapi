@@ -42,10 +42,11 @@ python -m unittest test_newapi_utils.NewApiCoreTests.test_robbery_uses_random_qu
   - `NewApiSuitePlugin.on_load()` 从 `self.ctx` 读取配置和数据目录，创建并初始化 `NewApiCore`；`on_config_update()` 更新配置并调用核心的 `refresh_config()`。
   - 用户和管理员指令通过 SDK 的 `@Command` 声明。命令处理器从 `kwargs` 获取 `message`、`stream_id` 和 `matched_groups`，通过 `self.ctx.send.text(text, stream_id)` 发送回复，并返回 `(success, response, weight)`。
   - `_extract_user_id()`、`_extract_username()`、`_extract_mention()` 和 `_extract_stream_id()` 兼容多种 MaiBot/平台消息字典结构。权限统一由 `_permission_allowed()` 和 `_is_admin()` 检查：普通命令受频道模式和私聊开关约束，管理员命令还要求发送者的用户名位于 `permission.admin_users`（用用户名而非 ID，避免 ID 作为大整数被配置系统丢失精度）。`_extract_mention()` 按消息段的 `at`/`mention` 类型解析 `id`/`target_id`/`user_id`/`qq` 等键，也支持 Discord 消息对象顶层的 `mentions` 数组，最后用正则兜底 `<@!?id>` 与 `[CQ:at,qq=id]`；注意不要误把角色 `<@&id>`、频道 `<#id>` 识别为用户。
+  - 命令的目标解析统一走 `_resolve_target()`（异步）：依次尝试 `_extract_mention()`、纯数字 `matched_groups["identifier"]`，最后若以 `@` 开头则去掉 `@` 按 `newapi_bindings.qq_username` 查绑定记录返回其 `qq_id`。这是因为某些平台适配器（如 litroenade/MaiBot-Discord-Adapter）会把消息中的 `<@ID>` 替换为 `@用户名` 文本并丢弃数字 ID，插件只能在绑定时记录用户名再反向查表。绑定流程 `_perform_binding_ritual()` 会用 `_extract_username()` 保存用户名到 `qq_username` 列。
   - 当前命令为：`/查询余额`、`/绑定 <网站ID>`、`/签到`、`/打劫 <ID或@用户>`、管理员 `/查询 <ID或@用户>`、管理员 `/解绑 <ID或@用户>`、管理员 `/调整余额 <ID或@用户> <数额>`。
 
 - **`newapi_utils.py`** 提供 `NewApiCore`，负责本地数据、NewAPI HTTP 请求和额度业务。
-  - SQLite 数据库默认为 `self.ctx.paths.data_dir / "newapi_data.db"`，建表时启用 WAL。核心表 `newapi_bindings` 保存平台用户 ID、网站用户 ID、绑定时间和最近签到时间。
+  - SQLite 数据库默认为 `self.ctx.paths.data_dir / "newapi_data.db"`，建表时启用 WAL。核心表 `newapi_bindings` 保存平台用户 ID、网站用户 ID、绑定时间、最近签到时间和绑定时的用户名（`qq_username`，用于按用户名反向解析目标）。
   - `execute_query()` 通过 `asyncio.to_thread()` 执行同步 SQLite 操作，查询结果转换为字典；不要在命令处理器中直接操作数据库。
   - `api_request()` 仅使用管理员 PAT 的 `Authorization: Bearer ...` 请求头访问 NewAPI，不使用已废弃的 `New-Api-User` 头。API 配置优先读取 `plugin.config.api`，缺失时兼容插件目录下的 `config.toml` `[api]` 段和 `.env`（`API_BASE_URL`、`API_ACCESS_TOKEN`）。不要把令牌写入源码或提交内容。
   - NewAPI 的 `quota` 是原始整数额度；用户可见额度使用 `quota / binding.quota_display_ratio`，配置中的签到、打劫和调整数值均为可见额度，写回 API 前必须乘以该比例。展示比例必须大于零。
