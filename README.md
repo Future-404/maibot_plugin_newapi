@@ -1,76 +1,755 @@
 # NewAPI Suite Plugin for MaiBot
 
-MaiBot 的 NewAPI 管理插件，提供网站账号绑定、余额查询、每日签到，以及管理员查询、解绑和增加额度。
+> 打通 MaiBot 与 NewAPI 的管理插件，提供 **网站账号绑定、余额查询、每日签到、娱乐打劫** 以及 **管理员查询 / 解绑 / 调额** 功能。
+> 插件版本：`2.3.1` ｜ 插件 ID：`future-404.maibot-plugin-newapi`
 
-## 功能
+---
 
-- 绑定 Discord / QQ 平台用户与 NewAPI 网站用户 ID，并同步网站用户组。
-- 用户通过 `/查询余额` 查询绑定账户的真实余额。
-- 用户通过 `/签到` 获得随机、翻倍或首次签到奖励。
-- 用户通过 `/打劫 @用户` 进行可配置概率的余额转移；成功可能获得双倍额度，失败会按规则赔付对方并进入通缉状态。
-- 签到、打劫和管理员加额都调用 NewAPI 的管理员原子调额接口 `POST /api/user/manage`。
-- 本地 SQLite 使用 WAL，网站用户 ID 具有唯一性；签到采用原子占位防止并发重复领取。
-- 管理员可使用 `/查询 [@用户/ID]`、`/解绑 [@用户/ID]`、`/调整余额 [@用户/ID] [正数]`。
+## 目录
 
-## 环境要求
+1. [整体项目介绍](#1-整体项目介绍)
+2. [功能一览](#2-功能一览)
+3. [环境要求](#3-环境要求)
+4. [安装方法](#4-安装方法)
+5. [命令一览](#5-命令一览)
+6. [用户命令详解](#6-用户命令详解)
+7. [管理员命令详解](#7-管理员命令详解)
+8. [WebUI 配置详解](#8-webui-配置详解)
+9. [权限模型](#9-权限模型)
+10. [数据库与数据存储](#10-数据库与数据存储)
+11. [文件结构说明](#11-文件结构说明)
+12. [额度换算与 NewAPI 接口说明](#12-额度换算与-newapi-接口说明)
+13. [开发与验证](#13-开发与验证)
+14. [常见问题与注意事项](#14-常见问题与注意事项)
+15. [开源协议](#15-开源协议)
 
-- MaiBot >= 1.1.3
-- MaiBot 随附的 `maibot-plugin-sdk`（建议 >= 2.7.1）
-- NewAPI 最新版，且配置的管理员 PAT 对目标网站用户拥有管理权限。
+---
 
-## 安装与配置
+## 1. 整体项目介绍
 
-1. 将本目录放入 MaiBot 的 `plugins` 文件夹。
-2. 启动 MaiBot，插件会被自动发现并加载。
-3. 在 WebUI 插件配置页配置：
-   - `api_base_url`：NewAPI 站点地址。
-   - `api_access_token`：管理员 PAT 或访问令牌。
-   - `binding_group`：绑定成功后授予的用户组。
-   - `unbind_group`：解绑时恢复的用户组。
-   - `quota_display_ratio`：显示额度到 NewAPI 原始整数额度的换算比例，必须大于零。
-   - `robbery.enabled`：是否启用打劫。
-   - `robbery.success_chance` / `double_chance`：成功概率与双倍概率。
-   - `robbery.base_display_quota`：成功时的基础转移额度。
-   - `robbery.cooldown_seconds` / `wanted_seconds`：成功冷却和失败通缉时间。
-   - `robbery.failure_penalty_ratio` / `failure_penalty_max_display_quota`：失败时从打劫者余额赔付给对方的比例和上限。
-   - 打劫结果文案：`robbery` 下的 `*_template` 字段可在 WebUI 中配置，覆盖功能关闭、绑定校验、余额不足、结算、冷却、通缉、成功及失败提示。
-     - 可用变量：`{wait_seconds}`、`{display_amount:.2f}`、`{display_total:.2f}`、`{wanted_seconds}`、`{status}`。
-     - 模板字段缺失或格式错误时，插件会使用内置中文文案，确保命令仍可回复。
-4. 也可在插件目录的运行时 `config.toml` `[api]` 段或 `.env` 中设置 `API_BASE_URL`、`API_ACCESS_TOKEN`。WebUI 配置优先。
+`maibot_plugin_newapi` 是运行在 **MaiBot（>= 1.1.3）** 上的管理插件，使用 MaiBot 新版 Host / Runner 插件架构和 `maibot-plugin-sdk`。
 
-管理员 PAT 必须能够管理被绑定的网站用户；普通管理员不能管理同级或更高角色的账户。
+插件解决的核心问题：**让聊天平台的用户（Discord / QQ / 其他）与 NewAPI 网站用户一一对应**，并在此基础上提供一套完整的额度（Quota）运营能力：
 
-## 绑定说明
+- 用户把聊天账号与自己的 NewAPI 网站用户 ID **绑定**，绑定后自动把该网站用户加入配置的会员分组。
+- 用户可以随时 `/查询余额` 查看自己网站账号的真实额度。
+- 用户每天可以 `/签到`，插件通过 NewAPI 管理员调额接口把奖励额度**直接写入绑定网站用户**（不需要生成兑换码、不需要用户手动兑换）。
+- 用户之间可以 `/打劫`，是一个带概率、冷却、通缉、双倍的娱乐性额度转移玩法，所有规则均可由管理员在网页后台配置。
+- 管理员可以通过 `/查询`、`/解绑`、`/调整余额` 管理任意绑定关系与额度。
 
-`/绑定 <网站ID>` 保留为自助操作。它通过网站 ID 建立映射并调整该网站用户组，但聊天平台无法凭网站 ID 验证账户归属。请只在可信频道启用插件，或通过 `permission.mode`、白名单和管理员配置限制可用范围。
+所有额度变动都使用 **NewAPI 管理员原子调额接口 `POST /api/user/manage`**（`action: add_quota`，配合 `mode: add` / `mode: subtract`），额度直接落在目标网站用户账户上，不会创建兑换码，也不会以管理员身份冒用用户身份兑换。
 
-## 开发验证
+---
 
-安装依赖：
+## 2. 功能一览
+
+| 功能 | 说明 |
+|---|---|
+| **账号绑定** | 平台用户 ↔ NewAPI 网站用户 ID 一一对应；绑定后自动同步网站用户组 |
+| **余额查询** | 用户实时查询绑定网站账号的显示额度 |
+| **每日签到** | 每天一次，奖励额度直接入账；支持随机额度、双倍概率、首签礼包 |
+| **娱乐打劫** | 用户互劫余额；支持成功概率、双倍概率、失败赔付、成功冷却、失败通缉，全部参数可配置 |
+| **管理员查询** | 按网站 ID / 用户 ID / @提及 查询绑定详情 |
+| **管理员解绑** | 解除绑定并自动把网站用户恢复到解绑分组 |
+| **管理员调额** | 给指定绑定账号增加正数额度 |
+| **WebUI 全量配置** | 所有规则、概率、时间、话术均可在 MaiBot 网页后台配置 |
+| **防刷与一致性** | SQLite WAL、签到/打劫原子占位、网站 ID 唯一约束、跨账户失败补偿 |
+| **话术模板** | 签到成功、打劫成功/失败/冷却/通缉等文案均支持模板变量自定义 |
+
+---
+
+## 3. 环境要求
+
+| 依赖 | 版本要求 | 说明 |
+|---|---|---|
+| **MaiBot** | `>= 1.1.3` | 新版 Host/Runner 插件架构 |
+| **maibot-plugin-sdk** | `>= 2.0.0`（建议随宿主版本，如 `>= 2.7.1`） | 插件运行依赖 |
+| **NewAPI** | 最新版 | 需要管理员 PAT，且对新 API 用户具备管理权限 |
+| **Python** | 3.10+ | 运行 `httpx`、`pydantic` 等依赖 |
+
+> MaiBot 会通过 `_manifest.json` 自动为插件安装 `httpx` 依赖，无需手动安装到宿主机。
+
+---
+
+## 4. 安装方法
+
+### 4.1 放入插件目录
+
+把整个项目目录（即本仓库）复制到 MaiBot 的 `plugins` 文件夹下，例如：
+
+```text
+MaiBot/
+└── plugins/
+    └── maibot_plugin_newapi/   ← 本插件
+        ├── _manifest.json
+        ├── plugin.py
+        ├── newapi_utils.py
+        └── ...
+```
+
+### 4.2 启动并自动加载
+
+启动 MaiBot，插件会被自动发现并加载。插件日志使用 `newapi_suite` 名称，可在 MaiBot 日志中搜索确认加载状态：
+
+```text
+[NewAPI Plugin] NewAPI 核心引擎初始化成功。
+```
+
+### 4.3 配置 API 连接
+
+至少需要配置两项才能正常使用：
+
+- **NewAPI 基础 URL**
+- **具备管理员权限的 API 访问令牌（PAT）**
+
+配置方式有两种（WebUI 优先）：
+
+1. **MaiBot 网页后台** → 插件配置页（推荐，见 [第 8 节](#8-webui-配置详解)）。
+2. **运行时配置文件**：在插件目录放置 `config.toml`（`[api]` 段）或 `.env` 文件。
+
+   `config.toml` 示例：
+
+   ```toml
+   [api]
+   api_base_url = "http://172.17.0.1:3000"
+   api_access_token = "sk-xxxxxxx"
+   ```
+
+   `.env` 示例：
+
+   ```env
+   API_BASE_URL=http://172.17.0.1:3000
+   API_ACCESS_TOKEN=sk-xxxxxxx
+   ```
+
+> ⚠️ `config.toml`、`.env`、`*.db` 已在 `.gitignore` 中排除，不会被提交。请勿把令牌写进源码。
+
+---
+
+## 5. 命令一览
+
+| 命令 | 权限 | 作用 |
+|---|---|---|
+| `/查询余额` | 普通用户 | 查看自己绑定网站的当前额度 |
+| `/绑定 <网站ID>` | 普通用户 | 把自己的聊天账号绑定到 NewAPI 网站用户 |
+| `/签到` | 普通用户 | 领取每日签到奖励额度 |
+| `/打劫 @用户` 或 `/打劫 <用户ID>` | 普通用户 | 对目标用户发起一次打劫 |
+| `/查询 [@用户 / 用户ID / 网站ID]` | 管理员 | 查询指定用户的绑定详情 |
+| `/解绑 [@用户 / 用户ID / 网站ID]` | 管理员 | 解除绑定并恢复网站用户分组 |
+| `/调整余额 [@用户 / 用户ID / 网站ID] [正数]` | 管理员 | 给指定绑定账号增加额度 |
+
+---
+
+## 6. 用户命令详解
+
+### 6.1 `/查询余额`
+
+**作用**：查看当前发送者的绑定网站账号的显示额度。
+
+**调用方式**：
+
+```text
+/查询余额
+```
+
+**权限**：普通用户（受频道白/黑名单与私聊开关约束）。
+
+**执行逻辑**：
+1. 提取发送者聊天账号 ID。
+2. 查本地绑定记录，确认已绑定。
+3. 调用 NewAPI `GET /api/user/{网站ID}` 读取原始额度。
+4. 按 `binding.quota_display_ratio` 换算为显示额度并回复。
+
+**成功回复示例**：
+
+```text
+查询成功！
+网站ID: 2001
+当前剩余额度: 3.00
+```
+
+**常见失败**：
+- 未绑定 → `您尚未绑定网站ID，无法进行此操作。`
+- 无法读取网站信息 → `查询失败，无法从网站获取余额信息。`
+
+---
+
+### 6.2 `/绑定 <网站ID>`
+
+**作用**：把当前发送者的聊天账号与一个 NewAPI 网站用户 ID 建立绑定关系，并把该网站用户加入 `binding.binding_group` 分组。
+
+**调用方式**：
+
+```text
+/绑定 2001
+```
+
+**参数说明**：
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `网站ID` | 是 | NewAPI 网站用户的数字 ID |
+
+**权限**：普通用户。
+
+**执行逻辑**（依次校验，任一失败即停止）：
+1. 当前账号未绑定（已绑定则拒绝）。
+2. 网站 ID 在 NewAPI 中存在（`GET /api/user/{id}`）。
+3. 该网站 ID 未被其他用户绑定（本地唯一性检查 + 数据库唯一约束双保险）。
+4. 获取网站用户资料 → 把 `group` 改为 `binding.binding_group` → `PUT /api/user/` 更新远端分组。
+5. 本地插入绑定记录。
+
+**成功回复示例**：
+
+```text
+绑定成功！
+网站ID: 2001
+专属分组: vip
+```
+
+**常见失败**：
+- 已绑定 → `您已经绑定了网站ID: xxx，无需重复绑定。`
+- 网站用户不存在 → `找不到网站ID为 xxx 的用户，请检查ID是否正确。`
+- 已被他人绑定 → `网站ID xxx 已被其他用户绑定。`
+- 远端分组更新失败 → `绑定失败，无法更新网站账户分组。`
+
+> ⚠️ **安全说明**：`/绑定` 是自助操作。聊天平台无法凭一个数字网站 ID 验证账户归属，因此**任何能发消息的用户都可能绑定任意网站 ID**。请仅在可信频道启用插件，或通过 `permission.mode` / 白名单 / 管理员限制可用范围。
+
+---
+
+### 6.3 `/签到`
+
+**作用**：每天领取一次签到奖励，奖励额度直接写入绑定网站账号。
+
+**调用方式**：
+
+```text
+/签到
+```
+
+**权限**：普通用户。
+
+**执行逻辑**：
+1. 检查 `check_in.enabled`（关闭则提示）。
+2. 确认已绑定。
+3. 按 `check_in.timezone_offset_hours` 计算"今天"的边界，使用 SQLite 原子占位防止同一天重复领取（并发也只会成功一次）。
+4. 计算奖励：
+   - 基础额度在 `check_in.min_display_quota` ~ `check_in.max_display_quota` 之间随机。
+   - 按 `check_in.double_chance` 概率翻倍。
+   - 若为首次签到且开启首签礼包，追加 `check_in.first_check_in_bonus_display_quota`。
+5. 调用 NewAPI `POST /api/user/manage`（`mode: add`）把原始额度写入绑定网站用户。
+6. 读取最新余额用于回复；若入账成功但读取余额失败，返回"已到账但余额未知"。
+
+**成功回复示例**：
+
+```text
+签到成功！
+您获得了 5.23 额度！
+当前剩余总额度为 12.34。
+```
+
+**失败回滚**：若 NewAPI 入账失败，插件会**仅释放本次签到占位**，用户稍后可重试；不会把并发成功签到记录误删。
+
+**话术模板**：见 [8.5 每日签到规则与模版](#85-每日签到规则与模版)。
+
+---
+
+### 6.4 `/打劫 @用户` / `/打劫 <用户ID>`
+
+**作用**：对目标用户发起一次打劫，涉及成功/失败/双倍/冷却/通缉，全部规则可在 WebUI 配置。
+
+**调用方式**：
+
+```text
+/打劫 @目标用户          # Discord/QQ 直接 @
+/打劫 <目标用户ID>       # 纯数字用户 ID
+```
+
+**权限**：普通用户。
+
+**基础校验**（任一失败即停止）：
+- 打劫功能已启用（`robbery.enabled`）。
+- 不能打劫自己。
+- 打劫者和目标都已完成绑定。
+- 额度展示比例配置有效。
+
+**执行逻辑**：
+
+1. **状态抢占**：使用 SQLite `BEGIN IMMEDIATE` 原子检查并记录打劫者状态，防止并发打劫绕过冷却/通缉。
+2. **冷却 / 通缉检查**：
+   - 若打劫者在通缉期（`wanted_until` 未到）→ 拒绝并提示剩余秒数。
+   - 若打劫者处于成功冷却期（`cooldown_until` 未到）→ 拒绝并提示剩余秒数。
+3. **读取双方余额**。
+4. **判定结果**（`random.random() < success_chance`）：
+   - **成功**：
+     - 基础转移额度在 `robbery.min_display_quota` ~ `robbery.max_display_quota` 之间随机（兼容旧字段 `base_display_quota`）。
+     - 按 `robbery.double_chance` 概率翻倍，翻倍后**仍不超过目标当前余额**。
+     - 从目标账户 `subtract` 扣款 → 给打劫者 `add` 加款。
+     - 成功后设置成功冷却 `cooldown_seconds`。
+   - **失败**：
+     - 从打劫者当前余额按 `failure_penalty_ratio` 计算赔付额度，受 `failure_penalty_max_display_quota` 上限约束。
+     - 从打劫者 `subtract` 扣款 → 给目标 `add` 加款。
+     - 失败后设置通缉 `wanted_seconds`（通缉期间不能再打劫）。
+5. **一致性保障**：
+   - 跨账户转账为两个独立远端请求。第二步失败时，插件会**尝试反向补偿**第一步。
+   - 若第二步"网络结果未知"（如超时），插件**不会盲目补偿**，避免远端其实已入账导致的重复增发，而是返回不确定状态。
+   - 若补偿也失败，记录严重日志并返回"回滚失败，请联系管理员"。
+
+**成功回复示例**：
+
+```text
+打劫得手！
+获得 6.50 额度！
+当前总额度为 20.00。
+```
+
+**双倍回复示例**：
+
+```text
+打劫双倍得手！
+获得 13.00 额度！
+当前总额度为 26.50。
+```
+
+**失败回复示例**：
+
+```text
+打劫失败！您赔付给对方 2.10 额度，并被通缉 600 秒。
+```
+
+**冷却回复示例**：
+
+```text
+打劫冷却中，请 120 秒后再试。
+```
+
+**通缉回复示例**：
+
+```text
+您正在被通缉，请 300 秒后再试。
+```
+
+**话术模板**：见 [8.6 打劫规则与文案](#86-打劫规则与文案)。
+
+---
+
+## 7. 管理员命令详解
+
+> 三个管理员命令都需要发送者在 `permission.admin_users`（用户名列表）中，否则回复 `权限不足。`。
+
+### 7.1 `/查询 [@用户 / 用户ID / 网站ID]`
+
+**作用**：查询指定绑定记录。
+
+**调用方式**：
+
+```text
+/查询
+/查询 2001            # 按网站 ID 或用户 ID
+/查询 @目标用户         # 按 @提及
+```
+
+**权限**：管理员。
+
+**执行逻辑**：把参数当作"网站 ID"或"用户 ID"查本地绑定表，命中任一即返回。
+
+**成功回复示例**：
+
+```text
+查询成功！
+网站ID: 2001
+用户ID: 1001
+```
+
+**常见失败**：`未找到绑定记录。` / `格式错误。`
+
+---
+
+### 7.2 `/解绑 [@用户 / 用户ID / 网站ID]`
+
+**作用**：解除指定绑定，并把该网站用户在 NewAPI 的 `group` 恢复到 `binding.unbind_group`。
+
+**调用方式**：
+
+```text
+/解绑
+/解绑 2001
+/解绑 @目标用户
+```
+
+**权限**：管理员。
+
+**执行逻辑**：
+1. 解析目标绑定。
+2. 调用 NewAPI `GET /api/user/{id}` 获取用户资料 → 修改 `group` 为 `unbind_group` → `PUT /api/user/` 更新。
+3. **仅当远端分组恢复成功后才删除本地绑定记录**；远端失败时保留本地绑定并提示失败，方便重试。
+
+**成功回复示例**：
+
+```text
+解绑成功。
+```
+
+**失败回复示例**：
+
+```text
+解绑失败，已保留绑定记录以便重试。
+```
+
+---
+
+### 7.3 `/调整余额 [@用户 / 用户ID / 网站ID] [正数]`
+
+**作用**：给指定绑定网站账号增加正数显示额度。
+
+**调用方式**：
+
+```text
+/调整余额 2001 5
+/调整余额 2001 2.5
+/调整余额 @目标用户 10
+```
+
+**参数说明**：
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `@用户 / 用户ID / 网站ID` | 是 | 目标绑定 |
+| `正数` | 是 | 增加的显示额度（换算后必须是整数原始额度） |
+
+**权限**：管理员。
+
+**执行逻辑**：
+1. 解析目标绑定。
+2. 用 `Decimal` 精确计算 `显示额度 × quota_display_ratio`，结果必须为整数原始额度（否则返回 `INVALID_AMOUNT`）。
+3. 调用 NewAPI `POST /api/user/manage`（`mode: add`）入账。
+4. 读取最新余额并回复。
+
+**成功回复示例**：
+
+```text
+成功增加额度！当前余额: 8.00
+```
+
+**失败情况**：
+- 仅支持正数：负数 / 零 → `调整失败：仅支持大于零的增加额度。`
+- 换算后不是整数原始额度 → `调整失败：仅支持大于零的增加额度。`
+
+> ⚠️ 当前版本只支持**增加**额度，不支持扣减。负号虽然能被命令正则解析，但业务上会被拒绝。
+
+---
+
+## 8. WebUI 配置详解
+
+插件配置在 MaiBot 网页后台 → 插件管理 → NewAPI 插件套件 中，按配置段分组展示。以下按段逐一说明**每一个字段**。
+
+### 8.1 插件基础设施（`plugin`）
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `enabled` | `true` | 是否启用插件 |
+| `config_version` | `2.3.1` | 配置规范版本。**不要删除**，MaiBot 用它校验配置文件结构 |
+
+> ⚠️ 这个配置段是 MaiBot 配置文件解析的**必需契约**，不能删掉。缺少会导致 WebUI 报错 `插件配置文件缺少 [plugin] 配置节`。
+
+---
+
+### 8.2 NewAPI 连接设置（`api`）
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `api_base_url` | 空 | NewAPI 站点地址，例如 `http://172.17.0.1:3000` 或你的外部域名。末尾不要带斜杠 |
+| `api_access_token` | 空 | 管理员 PAT 或访问令牌。**必填**，必须属于有管理员角色的用户，且能管理被绑定的网站用户 |
+
+> 若在 WebUI 留空，插件会回退读取插件目录下的 `config.toml` `[api]` 段或 `.env`。全部为空时插件无法连接 NewAPI，签到/打劫/调额不可用。
+
+---
+
+### 8.3 权限控制（`permission`）
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `mode` | `all` | 运行模式：`all`（所有人可用）/ `whitelist`（仅白名单频道）/ `blacklist`（黑名单频道除外） |
+| `whitelist` | `[]` | 白名单频道 ID 列表，`mode=whitelist` 时生效 |
+| `blacklist` | `[]` | 黑名单频道 ID 列表，`mode=blacklist` 时生效 |
+| `admin_users` | `[]` | **超级管理员用户名列表**。管理员命令（`/查询` `/解绑` `/调整余额`）和私聊管理员放行都依赖它 |
+
+> ⚠️ `admin_users` 使用**用户名**（字符串）而不是数字 ID。因为 MaiBot 配置系统会把大整数 ID 当数值处理，导致 Discord snowflake 等 64 位 ID 精度丢失。请填入用户在平台上的用户名（如 Discord 用户名、QQ 昵称）。
+
+---
+
+### 8.4 账号绑定规则（`binding`）
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `binding_group` | `vip` | 绑定成功后赋予网站用户的组别 |
+| `unbind_group` | `default` | 解绑后恢复的组别 |
+| `quota_display_ratio` | `500000.0` | 额度展示比例。NewAPI 的 `quota` 是原始整数额度，显示额度 = `quota / quota_display_ratio`；配置里所有"显示额度"在写回 API 前都会乘以该比例。**必须大于 0** |
+
+---
+
+### 8.5 每日签到规则与模版（`check_in`）
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `enabled` | `true` | 是否启用签到功能 |
+| `timezone_offset_hours` | `8` | 签到"当天"的时区偏移（小时）。中国用户填 `8` |
+| `min_display_quota` | `0.1` | 签到最小显示额度 |
+| `max_display_quota` | `10.0` | 签到最大显示额度（每次在 min~max 间随机） |
+| `double_chance` | `0.1` | 签到翻倍概率（0~1） |
+| `first_check_in_bonus_enabled` | `true` | 是否开启首次签到奖励 |
+| `first_check_in_bonus_display_quota` | `100.0` | 首次签到额外奖励的显示额度 |
+| `check_in_success_template` | `签到成功！\n您获得了 {display_added:.2f} 额度！\n当前剩余总额度为 {display_total:.2f}。` | 常规签到成功话术模板 |
+| `check_in_doubled_template` | `奖励翻倍！获得了 {display_added:.2f} 额度！\n当前剩余总额度为 {display_total:.2f}。` | 翻倍签到成功话术模板 |
+| `first_check_in_success_template` | `欢迎新人！您获得了 {display_added:.2f} 额度。\n当前剩余总额度为 {display_total:.2f}。` | 首次签到成功话术模板 |
+
+**签到模板可用变量**：
+
+| 变量 | 含义 |
+|---|---|
+| `{display_added:.2f}` | 本次到账的显示额度 |
+| `{display_total:.2f}` | 到账后的总显示额度 |
+
+> 模板格式错误时会自动回退到内置文案，不会影响命令回复。
+
+---
+
+### 8.6 打劫规则与文案（`robbery`）
+
+#### 规则参数
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `enabled` | `true` | 是否启用打劫功能 |
+| `success_chance` | `0.5` | 打劫成功概率（0~1） |
+| `double_chance` | `0.1` | 成功后获得双倍额度的概率（0~1） |
+| `base_display_quota` | `10.0` | **兼容旧配置**的固定转移额度。当 `min/max_display_quota` 生效时优先使用随机范围 |
+| `min_display_quota` | `1.0` | 成功时随机转移额度的**最小值**（显示额度） |
+| `max_display_quota` | `10.0` | 成功时随机转移额度的**最大值**（显示额度） |
+| `cooldown_seconds` | `300` | 成功后的冷却秒数（`0` = 不冷却） |
+| `failure_penalty_ratio` | `0.1` | 失败时按打劫者当前余额赔付给目标的比例（0~1） |
+| `failure_penalty_max_display_quota` | `10.0` | 失败赔付的显示额度上限（`0` = 不设上限） |
+| `wanted_seconds` | `600` | 失败后的通缉秒数，通缉期间不能再打劫 |
+
+#### 话术模板
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `disabled_template` | `打劫功能暂未开启。` | 功能关闭提示 |
+| `self_target_template` | `不能打劫自己哦！` | 打劫自己提示 |
+| `robber_not_bound_template` | `您尚未绑定网站ID，无法打劫。` | 打劫者未绑定提示 |
+| `victim_not_bound_template` | `对方尚未绑定网站ID，无法打劫。` | 目标未绑定提示 |
+| `invalid_quota_ratio_template` | `打劫失败：额度展示比例配置无效。` | 比例配置无效提示 |
+| `balance_unavailable_template` | `打劫失败：暂时无法读取双方余额。` | 余额读取失败提示 |
+| `victim_balance_empty_template` | `对方余额不足，无从下手！` | 目标余额不足提示 |
+| `api_update_failed_template` | `打劫结算失败，请稍后再试。` | 远端结算失败提示 |
+| `rollback_failed_template` | `打劫结算异常，资金状态未知，请联系管理员核查。` | 回滚失败提示 |
+| `cooldown_template` | `打劫冷却中，请 {wait_seconds} 秒后再试。` | 冷却提示模板 |
+| `wanted_template` | `您正在被通缉，请 {wait_seconds} 秒后再试。` | 通缉提示模板 |
+| `failed_template` | `打劫失败！您赔付给对方 {display_amount:.2f} 额度，并被通缉 {wanted_seconds} 秒。` | 失败提示模板 |
+| `success_template` | `打劫得手！\n获得 {display_amount:.2f} 额度！\n当前总额度为 {display_total:.2f}。` | 成功提示模板 |
+| `success_doubled_template` | `打劫双倍得手！\n获得 {display_amount:.2f} 额度！\n当前总额度为 {display_total:.2f}。` | 双倍成功提示模板 |
+| `success_balance_unknown_template` | `打劫得手！获得 {display_amount:.2f} 额度，但暂时无法读取最新余额。` | 成功但余额未知模板 |
+| `success_doubled_balance_unknown_template` | `打劫双倍得手！获得 {display_amount:.2f} 额度，但暂时无法读取最新余额。` | 双倍成功但余额未知模板 |
+| `unexpected_status_template` | `打劫处理异常: {status}` | 未知状态模板 |
+| `user_info_unavailable_template` | `无法获取您的用户信息。` | 用户信息缺失提示 |
+| `invalid_target_template` | `格式错误，请使用 /打劫 @用户 或 /打劫 用户ID。` | 目标格式错误提示 |
+
+**打劫模板可用变量**：
+
+| 变量 | 含义 |
+|---|---|
+| `{wait_seconds}` | 冷却 / 通缉剩余秒数 |
+| `{display_amount:.2f}` | 转移（或赔付）的显示额度 |
+| `{display_total:.2f}` | 打劫者到账后的总显示额度 |
+| `{wanted_seconds}` | 通缉秒数 |
+| `{status}` | 内部状态码 |
+
+> 模板字段缺失或格式错误时，插件会回退到内置中文文案，保证命令始终有回复。
+
+---
+
+### 8.7 私聊高级开关（`pm`）
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `enable_all_pm` | `true` | 是否允许所有用户在**私聊**中使用指令。为 `false` 时，私聊指令仅对 `permission.admin_users` 中的管理员放行 |
+
+---
+
+## 9. 权限模型
+
+权限检查由 `_permission_allowed()` 统一处理，顺序如下：
+
+1. **私聊消息**（`is_private_message` 或 `type=private`）：
+   - `pm.enable_all_pm = true` → 放行。
+   - 否则仅当发送者用户名在 `permission.admin_users` 中才放行。
+2. **群聊 / 频道消息**：
+   - `mode = whitelist`：仅 `channel_id` 在白名单中放行。
+   - `mode = blacklist`：`channel_id` 不在黑名单中放行。
+   - `mode = all`：全部放行。
+3. **管理员命令**（`/查询` `/解绑` `/调整余额`）：在通过上述基础检查后，**额外**要求发送者用户名在 `permission.admin_users` 中。
+
+---
+
+## 10. 数据库与数据存储
+
+插件使用 SQLite，数据库文件位于 MaiBot 数据目录：
+
+```text
+<MaiBot data_dir>/newapi_data.db
+```
+
+启用 WAL 模式以支持并发读写。
+
+### 表结构
+
+**`newapi_bindings`** — 绑定关系表：
+
+| 字段 | 说明 |
+|---|---|
+| `id` | 主键 |
+| `qq_id` | 平台用户 ID（唯一） |
+| `website_user_id` | NewAPI 网站用户 ID（唯一索引） |
+| `binding_time` | 绑定时间 |
+| `last_check_in_time` | 最近一次签到时间 |
+
+**`newapi_robbery_states`** — 打劫状态表：
+
+| 字段 | 说明 |
+|---|---|
+| `qq_id` | 打劫者用户 ID（主键） |
+| `cooldown_until` | 成功冷却截止时间 |
+| `wanted_until` | 通缉截止时间 |
+
+### 数据迁移
+
+直接替换旧版插件目录、保留同一 `data_dir` 时，新版会自动迁移：
+
+- 保留已有绑定数据。
+- 自动补充缺失的 `last_check_in_time` 列。
+- 自动创建 `newapi_robbery_states` 表。
+- 自动为 `website_user_id` 建立唯一索引。
+
+**需要人工处理**：
+- 旧库存在重复 `website_user_id`：插件会**拒绝启动**并列出重复 ID，需要先备份数据库、清理重复绑定后重启。
+- 旧表缺失核心列（`qq_id`、`website_user_id`）：无法安全自动修复，建议手工重建。
+
+> 💾 **升级前建议先备份 `newapi_data.db`**。
+
+---
+
+## 11. 文件结构说明
+
+```text
+maibot_plugin_newapi/
+├── _manifest.json        # 插件清单：声明插件 ID、版本、宿主/SDK 兼容范围、依赖、能力
+├── plugin.py             # 插件入口：配置模型、WebUI 元数据、生命周期、全部 @Command 命令
+├── newapi_utils.py       # 核心逻辑：SQLite、NewAPI 请求、额度换算、签到/打劫/调额/绑定/解绑
+├── test_newapi_utils.py  # 核心回归测试（unittest，覆盖签到并发、打劫资金流、迁移等）
+├── README.md             # 本文档
+├── CLAUDE.md             # 面向 Claude Code / AI 代理的开发指引
+├── requirements.txt      # Python 依赖声明（maibot-plugin-sdk、httpx）
+├── config.toml           # 运行时配置（可选，已 gitignore）
+├── .env                  # 环境变量配置（可选，已 gitignore）
+└── .gitignore            # Git 忽略规则
+```
+
+### 各文件职责
+
+**`_manifest.json`**
+MaiBot 发现和加载插件的入口描述：插件 ID `future-404.maibot-plugin-newapi`、版本 `2.3.1`、MaiBot `>= 1.1.3`、SDK `>= 2.0.0`、声明 `httpx` 依赖和 `send.text` 能力。修改版本范围时要考虑加载兼容性。
+
+**`plugin.py`**
+- 定义 7 个 `PluginConfigBase` 配置段（`plugin`、`api`、`permission`、`binding`、`check_in`、`robbery`、`pm`）。
+- 实现 `on_load` / `on_unload` / `on_config_update` 生命周期（配置热更新回调签名 `(scope, config_data, version)`）。
+- 实现 7 个 `@Command` 命令，以及权限判断、用户名/用户 ID/提及/流 ID 提取等工具方法。
+- 所有命令回复统一走 `_send_and_return(text, stream_id)`。
+
+**`newapi_utils.py`**
+- `NewApiCore`：负责 SQLite、NewAPI HTTP 请求和额度业务。
+- 关键方法：`perform_check_in()`（签到）、`perform_robbery()`（打劫）、`adjust_balance_by_identifier()`（管理员调额）、`bind` / `purge_user_binding` / `revert_user_group`（绑定/解绑）、`add_api_user_quota` / `change_api_user_quota`（管理员加减额）。
+
+**`test_newapi_utils.py`**
+不依赖 MaiBot 宿主的回归测试，用临时 SQLite 和 mock HTTP 验证核心逻辑，包括签到并发防重、打劫资金流与回滚、旧库迁移、唯一约束等。
+
+---
+
+## 12. 额度换算与 NewAPI 接口说明
+
+### 额度换算
+
+- NewAPI 的 `quota` 是**原始整数额度**。
+- 显示额度 = `quota / binding.quota_display_ratio`。
+- 配置里的签到、打劫、调额数值都是**显示额度**，写回 API 前必须乘以 `quota_display_ratio` 并取整。
+
+### 使用的 NewAPI 接口
+
+| 接口 | 用途 |
+|---|---|
+| `GET /api/user/{id}` | 读取网站用户资料（余额、分组） |
+| `PUT /api/user/` | 更新用户分组（绑定/解绑时） |
+| `POST /api/user/manage` | **管理员原子调额**：`action: add_quota` + `mode: add/subtract` + `value: 原始额度` |
+
+所有请求使用 `Authorization: Bearer <管理员 PAT>`。**不依赖已废弃的 `New-Api-User` 头，不生成兑换码，不使用 `/api/user/topup`。**
+
+> ⚠️ 上游 NewAPI 的 `subtract` 不会自动阻止负余额。插件在扣款前会先读取余额并限制扣款额，但无法完全消除与并发消费竞争时的负余额风险。这是 NewAPI 接口本身的限制。
+
+---
+
+## 13. 开发与验证
+
+### 安装依赖
 
 ```bash
 pip install -r requirements.txt
 ```
 
-运行基础语法检查和核心回归测试：
+### 语法检查
 
 ```bash
 python -m compileall plugin.py newapi_utils.py
-python -m unittest test_newapi_utils.py
 ```
 
-插件依赖 MaiBot 的 Host/Runner 运行环境，最终验证应在非生产 NewAPI 测试账户中完成：确认管理员账户余额不变、绑定网站用户余额增加，并检查 NewAPI 管理日志中的 `add_quota` 操作。
+### 回归测试
 
-## 目录结构
-
-```text
-maibot_plugin_newapi/
-├── _manifest.json
-├── plugin.py
-├── newapi_utils.py
-└── test_newapi_utils.py
+```bash
+python -m unittest -v test_newapi_utils.py
 ```
 
-## 开源协议
+### 端到端验证建议
+
+插件依赖 MaiBot 的 Host/Runner 运行环境，最终验证应在**非生产** NewAPI 测试账户中完成：
+
+1. 配置管理员 PAT 和测试网站用户。
+2. 执行 `/绑定`、`/签到`、`/打劫`、`/调整余额`。
+3. 确认管理员账户余额不变、绑定网站用户余额按预期增减。
+4. 在 NewAPI 管理日志中检查 `add_quota` 操作。
+
+---
+
+## 14. 常见问题与注意事项
+
+**1. 插件加载失败，日志提示 `[plugin] 配置节` 缺失？**
+`plugin.config_version` 是 MaiBot 必需契约，配置中必须保留 `plugin` 段，不要删除。
+
+**2. 管理员命令一直提示权限不足？**
+`permission.admin_users` 现在使用**用户名**。请确认填入的是发送者在平台上的用户名，而不是数字 ID。
+
+**3. 签到/打劫提示"无法更新 NewAPI 系统额度"？**
+检查 `api_base_url`、`api_access_token` 是否正确，管理员 PAT 是否对目标网站用户有管理权限（普通管理员不能管理同级或更高角色）。
+
+**4. 打劫显示"资金状态未知，请联系管理员"？**
+说明跨账户第二步转账与补偿都失败，存在资金不一致风险，需要管理员到 NewAPI 后台核查双方账户额度。
+
+**5. 升级后插件拒绝启动，提示重复网站 ID？**
+旧数据库存在一个网站 ID 被多个用户绑定的历史数据。备份数据库后，删除/合并重复绑定记录再启动。
+
+**6. Discord 上能用 `/打劫 @用户` 吗？**
+可以。当前插件命令基于**文本正则匹配**（MaiBot 的 Discord 适配器把消息文本交给宿主，由 `command_pattern` 正则命中）。`/打劫 @用户` 在 Discord 上以普通文本消息触发；MaiBot 当前不注册 Discord 原生斜杠命令，因此该命令不会出现在 Discord 的命令菜单里。
+
+---
+
+## 15. 开源协议
 
 MIT License

@@ -30,6 +30,8 @@ class FakePlugin:
                 success_chance=1.0,
                 double_chance=0.0,
                 base_display_quota=1.0,
+                min_display_quota=1.0,
+                max_display_quota=1.0,
                 cooldown_seconds=300,
                 failure_penalty_ratio=0.1,
                 failure_penalty_max_display_quota=10.0,
@@ -211,6 +213,29 @@ class NewApiCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(details["display_amount"], 1.0)
         self.assertEqual(calls[0], {"id": 2002, "action": "add_quota", "mode": "subtract", "value": 500000})
         self.assertEqual(calls[1], {"id": 2001, "action": "add_quota", "mode": "add", "value": 500000})
+
+    async def test_robbery_uses_random_quota_range(self):
+        self.core.plugin.config.robbery.min_display_quota = 2.0
+        self.core.plugin.config.robbery.max_display_quota = 3.0
+        self.core.plugin.config.robbery.cooldown_seconds = 0
+        self.assertTrue(await self.core.insert_binding(1002, 2002))
+
+        async def fake_request(method, endpoint, json_data=None):
+            if endpoint == "/api/user/manage":
+                return {"success": True}
+            if endpoint in ("/api/user/2001", "/api/user/2002"):
+                return {"success": True, "data": {"quota": 5000000}}
+            self.fail(endpoint)
+
+        self.core.api_request = fake_request
+        amounts = []
+        for _ in range(5):
+            status, details = await self.core.perform_robbery(1001, 1002)
+            self.assertEqual(status, "SUCCESS")
+            amounts.append(details["display_amount"])
+        for amount in amounts:
+            self.assertGreaterEqual(amount, 2.0)
+            self.assertLessEqual(amount, 3.0)
 
     async def test_robbery_failure_pays_victim_and_wanted(self):
         self.core.plugin.config.robbery.success_chance = 0.0

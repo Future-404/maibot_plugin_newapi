@@ -16,7 +16,7 @@ class PluginSection(PluginConfigBase):
     __ui_order__ = 1
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="2.2.0", description="配置规范版本")
+    config_version: str = Field(default="2.3.1", description="配置规范版本")
 
 
 class ApiSettings(PluginConfigBase):
@@ -36,7 +36,7 @@ class PermissionSettings(PluginConfigBase):
     mode: str = Field(default="all", description="运行模式: all / whitelist / blacklist")
     whitelist: List[str] = Field(default_factory=list, description="白名单列表")
     blacklist: List[str] = Field(default_factory=list, description="黑名单列表")
-    admin_users: List[int] = Field(default_factory=list, description="超级管理员 ID 列表")
+    admin_users: List[str] = Field(default_factory=list, description="超级管理员用户名列表（使用用户名避免 ID 精度丢失）")
 
 
 class BindingSettings(PluginConfigBase):
@@ -83,7 +83,9 @@ class RobberySettings(PluginConfigBase):
     enabled: bool = Field(default=True, description="是否启用打劫功能")
     success_chance: float = Field(default=0.5, ge=0, le=1, description="打劫成功概率")
     double_chance: float = Field(default=0.1, ge=0, le=1, description="成功后获得双倍额度的概率")
-    base_display_quota: float = Field(default=10.0, gt=0, description="普通成功时转移的额度")
+    base_display_quota: float = Field(default=10.0, gt=0, description="普通成功时转移的额度（兼容旧配置，优先使用随机范围）")
+    min_display_quota: float = Field(default=1.0, gt=0, description="普通成功时转移的最小额度")
+    max_display_quota: float = Field(default=10.0, gt=0, description="普通成功时转移的最大额度")
     cooldown_seconds: int = Field(default=300, ge=0, description="成功后的冷却秒数")
     failure_penalty_ratio: float = Field(default=0.1, ge=0, le=1, description="失败时按当前余额赔付的比例")
     failure_penalty_max_display_quota: float = Field(
@@ -160,14 +162,37 @@ class NewApiSuitePlugin(MaiBotPlugin):
         except Exception as error:
             logger.error("[NewAPI Plugin] 动态更新配置失败: %s", error)
 
-    def _is_admin(self, user_id: Optional[int]) -> bool:
-        return user_id is not None and user_id in self.config.permission.admin_users
+    def _extract_username(self, message: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(message, dict):
+            return None
+        candidates = [
+            message.get("username"),
+            message.get("nickname"),
+            (message.get("user_info") or {}).get("username"),
+            (message.get("user_info") or {}).get("nickname"),
+            ((message.get("message_info") or {}).get("user_info") or {}).get("username"),
+            ((message.get("message_info") or {}).get("user_info") or {}).get("nickname"),
+            (message.get("user") or {}).get("username"),
+            (message.get("user") or {}).get("global_name"),
+            (message.get("user") or {}).get("display_name"),
+            (message.get("sender") or {}).get("username"),
+            (message.get("sender") or {}).get("display_name"),
+            (message.get("author") or {}).get("username"),
+            (message.get("author") or {}).get("display_name"),
+        ]
+        for value in candidates:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _is_admin(self, username: Optional[str]) -> bool:
+        return username is not None and username in self.config.permission.admin_users
 
     def _permission_allowed(self, message: Dict[str, Any]) -> bool:
         permission = self.config.permission
         channel_id = str(message.get("channel_id", ""))
         if message.get("is_private_message") or message.get("type", "") == "private":
-            return self.config.pm.enable_all_pm or self._is_admin(self._extract_user_id(message))
+            return self.config.pm.enable_all_pm or self._is_admin(self._extract_username(message))
         if permission.mode == "whitelist":
             return channel_id in permission.whitelist
         if permission.mode == "blacklist":
@@ -214,12 +239,22 @@ class NewApiSuitePlugin(MaiBotPlugin):
                     continue
                 data = segment.get("data") or {}
                 if segment.get("type") in ("at", "mention"):
-                    for key in ("user_id", "target_user_id", "qq"):
+                    for key in ("id", "target_id", "user_id", "target_user_id", "qq"):
                         try:
                             if data.get(key) is not None:
                                 return int(data[key])
                         except (TypeError, ValueError):
                             continue
+        mentions = message.get("mentions", [])
+        if isinstance(mentions, list):
+            for mention in mentions:
+                if not isinstance(mention, dict):
+                    continue
+                try:
+                    if mention.get("id") is not None:
+                        return int(mention["id"])
+                except (TypeError, ValueError):
+                    continue
         content = message.get("content", "") or message.get("raw_message", "")
         if not isinstance(content, str):
             return None
@@ -431,7 +466,7 @@ class NewApiSuitePlugin(MaiBotPlugin):
         stream_id = self._extract_stream_id(kwargs, message)
         if not self._permission_allowed(message):
             return True, "", 0
-        if not self._is_admin(self._extract_user_id(message)):
+        if not self._is_admin(self._extract_username(message)):
             return await self._send_and_return("权限不足。", stream_id)
         identifier = self._resolve_identifier(message, kwargs.get("matched_groups", {}))
         if identifier is None:
@@ -448,7 +483,7 @@ class NewApiSuitePlugin(MaiBotPlugin):
         stream_id = self._extract_stream_id(kwargs, message)
         if not self._permission_allowed(message):
             return True, "", 0
-        if not self._is_admin(self._extract_user_id(message)):
+        if not self._is_admin(self._extract_username(message)):
             return await self._send_and_return("权限不足。", stream_id)
         identifier = self._resolve_identifier(message, kwargs.get("matched_groups", {}))
         if identifier is None:
@@ -467,7 +502,7 @@ class NewApiSuitePlugin(MaiBotPlugin):
         stream_id = self._extract_stream_id(kwargs, message)
         if not self._permission_allowed(message):
             return True, "", 0
-        if not self._is_admin(self._extract_user_id(message)):
+        if not self._is_admin(self._extract_username(message)):
             return await self._send_and_return("权限不足。", stream_id)
         matched = kwargs.get("matched_groups", {})
         identifier = self._resolve_identifier(message, matched)

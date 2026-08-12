@@ -364,8 +364,14 @@ class NewApiCore:
 
         if random.random() < config.success_chance:
             multiplier = 2 if random.random() < config.double_chance else 1
+            if getattr(config, "min_display_quota", None) and getattr(config, "max_display_quota", None):
+                base_display_quota = random.uniform(
+                    config.min_display_quota, config.max_display_quota
+                )
+            else:
+                base_display_quota = config.base_display_quota
             raw_amount = min(
-                int(config.base_display_quota * ratio) * multiplier,
+                int(base_display_quota * ratio) * multiplier,
                 max(0, int(victim_profile.get("quota", 0))),
             )
             if raw_amount <= 0:
